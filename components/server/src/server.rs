@@ -56,6 +56,7 @@ use kvproto::{
     brpb::create_backup, cdcpb::create_change_data, deadlock::create_deadlock,
     debugpb::create_debug, diagnosticspb::create_diagnostics, import_sstpb::create_import_sst,
     kvrpcpb::ApiVersion, resource_usage_agent::create_resource_metering_pub_sub,
+    recoverypb::create_recovery,
 };
 use pd_client::{PdClient, RpcClient};
 use raft_log_engine::RaftLogEngine;
@@ -103,7 +104,7 @@ use tikv::{
 };
 use tikv_util::{
     check_environment_variables,
-    config::{ensure_dir_exist, RaftDataStateMachine, VersionTrack},
+    config::{ensure_dir_exist, RaftDataStateMachine, VersionTrack, ReadableDuration, ReadableSize},
     math::MovingAvgU32,
     quota_limiter::{QuotaLimitConfigManager, QuotaLimiter},
     sys::{disk, register_memory_usage_high_water, SysQuota},
@@ -114,6 +115,8 @@ use tikv_util::{
 use tokio::runtime::Builder;
 
 use crate::{memory::*, raft_engine_switch::*, setup::*, signal_handler};
+
+use recovery::{RecoveryService};
 
 #[inline]
 fn run_impl<CER: ConfiguredRaftEngine, F: KvFormat>(config: TiKvConfig) {
@@ -141,6 +144,50 @@ fn run_impl<CER: ConfiguredRaftEngine, F: KvFormat>(config: TiKvConfig) {
 
     signal_handler::wait_for_signal(Some(tikv.engines.take().unwrap().engines));
     tikv.stop();
+}
+
+/// Run a TiKV server in recovery mode
+/// recovery tikv from mountpoint of block level storage
+/// recovery mode include:
+/// 1. no election happen between raft group
+/// 2. peer valid during a recovery time even without leader in its region
+/// 3. PD can not put any peer into tombstone
+/// 4. must ensure all region data with ts less than backup ts (below commit index) are safe
+
+// recovery mode parameter
+const MAX_ELECTION_TIME: usize = 24 * 60 * 60;
+const MAX_REGION_SIZE: u64 = 1024;
+const MAX_SPLIT_KEY: u64 = 1 << 31;
+
+pub fn recovery_tikv(mut config: TiKvConfig) {
+    // read the peer info from kv db before start tikv
+    println!("recovery_tikv start to work");
+    // TODO: assume 100 W regions, total memory consume for this regions is about xxx
+    let local_reader = recovery::new_reader(&config);
+
+    //TODO: how to save regions 
+    let _regions = local_reader.unwrap().get_local_region_meta();
+    // disable some configuration to ban raft election etc.
+        // For block-level recovery, no raft peers can start a new election.
+    let bt = config.raft_store.raft_base_tick_interval.0;
+    println!("raft base tick is {:?}", bt);
+    config.raft_store.raft_election_timeout_ticks = MAX_ELECTION_TIME;
+    // time to check if peer alive without the leader, will not check peer during this time interval
+    config.raft_store.peer_stale_state_check_interval = ReadableDuration(bt * 4 * MAX_ELECTION_TIME as _);
+    println!("peer_stale_state_check_interval is {}", config.raft_store.peer_stale_state_check_interval);
+    // duration allow a peer alive without leader in region, otherwise report the metrics and show peer as abnormal
+    config.raft_store.abnormal_leader_missing_duration = ReadableDuration(bt * 4 * MAX_ELECTION_TIME as _);
+    println!("abnormal_leader_missing_duration is {}", config.raft_store.abnormal_leader_missing_duration);
+    // duration allow a peer alive without leader in region, otherwise report the PD and delete itself(peer)
+    config.raft_store.max_leader_missing_duration = ReadableDuration(bt * 4 * MAX_ELECTION_TIME as _);
+    println!("max_leader_missing_duration is {}", config.raft_store.max_leader_missing_duration);
+    // Disable region split during recovering.
+    config.coprocessor.region_max_size = Some(ReadableSize::gb(MAX_REGION_SIZE));
+    config.coprocessor.region_split_size = ReadableSize::gb(MAX_REGION_SIZE);
+    config.coprocessor.region_max_keys = Some(MAX_SPLIT_KEY);
+    config.coprocessor.region_split_keys = Some(MAX_SPLIT_KEY);
+    // start a recovery service to interact with BR, BR will guilde the TiKV how to recovery data.
+    run_tikv(config); 
 }
 
 /// Run a TiKV server. Returns when the server is shutdown by the user, in which
@@ -1160,6 +1207,23 @@ impl<ER: RaftEngine> TiKvServer<ER> {
             .is_some()
         {
             warn!("failed to register resource metering pubsub service");
+        }
+
+        // the present tikv in recovery mode, start recovery service
+        if self.config.recovery_mode {
+            let recovery_service = RecoveryService::new(
+                // TODO: resued debug thread pool, we shall create a thread pool or reused someone?
+                //servers.server.get_debug_thread_pool().clone(),
+                engines.engines.clone(),
+                self.router.clone(),
+            );
+            if servers
+                .server
+                .register_service(create_recovery(recovery_service))
+                .is_some()
+            {
+                fatal!("failed to register recovery service");
+            }
         }
     }
 

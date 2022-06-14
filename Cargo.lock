@@ -2616,7 +2616,7 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.2"
-source = "git+https://github.com/pingcap/kvproto.git#0e2f26c0a46ae7d666d6ca4410046a39e0c96f36"
+source = "git+https://github.com/fengou1/kvproto?branch=ebs#59cf55d5c1395b1da553164f4ed2154ff59474c7"
 dependencies = [
  "futures 0.3.15",
  "grpcio",
@@ -4361,6 +4361,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "recovery"
+version = "0.1.0"
+dependencies = [
+ "encryption",
+ "encryption_export",
+ "engine_rocks",
+ "engine_traits",
+ "futures 0.3.15",
+ "grpcio",
+ "keys",
+ "kvproto",
+ "protobuf",
+ "raft_log_engine",
+ "raftstore",
+ "structopt",
+ "thiserror",
+ "tikv",
+ "tikv_alloc",
+ "tikv_util",
+ "toml",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.1.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5054,6 +5077,7 @@ dependencies = [
  "raft_log_engine",
  "raftstore",
  "rand 0.8.3",
+ "recovery",
  "resolved_ts",
  "resource_metering",
  "security",

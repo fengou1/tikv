@@ -1,0 +1,26 @@
+[package]
+name = "recovery"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+encryption = { path = "../../components/encryption", default-features = false }
+encryption_export = { path = "../../components/encryption/export", default-features = false }
+engine_rocks = { path = "../../components/engine_rocks", default-features = false }
+engine_traits = { path = "../../components/engine_traits", default-features = false }
+futures = { version = "0.3", features = ["executor"] }
+grpcio = { version = "0.10",  default-features = false, features = ["openssl-vendored", "protobuf-codec"] }
+keys = { path = "../../components/keys", default-features = false }
+kvproto = {git = "https://github.com/fengou1/kvproto", branch="ebs"}
+protobuf = { version = "2.8", features = ["bytes"] }
+raftstore = { path = "../../components/raftstore", default-features = false }
+tikv = { path = "../.." }
+tikv_alloc = { path = "../../components/tikv_alloc" }
+tikv_util = { path = "../../components/tikv_util", default-features = false }
+raft_log_engine = { path = "../raft_log_engine", default-features = false }
+structopt = "0.3"
+toml = "0.5"
+thiserror = "1.0"

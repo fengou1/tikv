@@ -264,6 +264,11 @@ pub fn overwrite_config_with_cmd_args(config: &mut TiKvConfig, matches: &ArgMatc
         config.storage.data_dir = data_dir.to_owned();
     }
 
+    // TODO: shall take bool value from command line
+    if let Some(_recovery_mode) = matches.value_of("recovery-mode") {
+        config.recovery_mode = true;
+    }
+
     if let Some(endpoints) = matches.values_of("pd-endpoints") {
         config.pd.endpoints = endpoints.map(ToOwned::to_owned).collect();
     }
