@@ -354,6 +354,7 @@ where
     UnsafeRecoveryDestroy(UnsafeRecoveryExecutePlanSyncer),
     UnsafeRecoveryWaitApply(UnsafeRecoveryWaitApplySyncer),
     UnsafeRecoveryFillOutReport(UnsafeRecoveryFillOutReportSyncer),
+    Campaign,
 }
 
 /// Message that will be sent to a peer.

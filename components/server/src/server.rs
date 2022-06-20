@@ -56,7 +56,7 @@ use kvproto::{
     brpb::create_backup, cdcpb::create_change_data, deadlock::create_deadlock,
     debugpb::create_debug, diagnosticspb::create_diagnostics, import_sstpb::create_import_sst,
     kvrpcpb::ApiVersion, resource_usage_agent::create_resource_metering_pub_sub,
-    recoverypb::create_recovery,
+    recoverypb::{create_recovery},
 };
 use pd_client::{PdClient, RpcClient};
 use raft_log_engine::RaftLogEngine;
@@ -116,7 +116,7 @@ use tokio::runtime::Builder;
 
 use crate::{memory::*, raft_engine_switch::*, setup::*, signal_handler};
 
-use recovery::{RecoveryService};
+use recovery::{RecoveryService, Leader};
 
 #[inline]
 fn run_impl<CER: ConfiguredRaftEngine, F: KvFormat>(config: TiKvConfig) {
@@ -144,50 +144,6 @@ fn run_impl<CER: ConfiguredRaftEngine, F: KvFormat>(config: TiKvConfig) {
 
     signal_handler::wait_for_signal(Some(tikv.engines.take().unwrap().engines));
     tikv.stop();
-}
-
-/// Run a TiKV server in recovery mode
-/// recovery tikv from mountpoint of block level storage
-/// recovery mode include:
-/// 1. no election happen between raft group
-/// 2. peer valid during a recovery time even without leader in its region
-/// 3. PD can not put any peer into tombstone
-/// 4. must ensure all region data with ts less than backup ts (below commit index) are safe
-
-// recovery mode parameter
-const MAX_ELECTION_TIME: usize = 24 * 60 * 60;
-const MAX_REGION_SIZE: u64 = 1024;
-const MAX_SPLIT_KEY: u64 = 1 << 31;
-
-pub fn recovery_tikv(mut config: TiKvConfig) {
-    // read the peer info from kv db before start tikv
-    println!("recovery_tikv start to work");
-    // TODO: assume 100 W regions, total memory consume for this regions is about xxx
-    let local_reader = recovery::new_reader(&config);
-
-    //TODO: how to save regions 
-    let _regions = local_reader.unwrap().get_local_region_meta();
-    // disable some configuration to ban raft election etc.
-        // For block-level recovery, no raft peers can start a new election.
-    let bt = config.raft_store.raft_base_tick_interval.0;
-    println!("raft base tick is {:?}", bt);
-    config.raft_store.raft_election_timeout_ticks = MAX_ELECTION_TIME;
-    // time to check if peer alive without the leader, will not check peer during this time interval
-    config.raft_store.peer_stale_state_check_interval = ReadableDuration(bt * 4 * MAX_ELECTION_TIME as _);
-    println!("peer_stale_state_check_interval is {}", config.raft_store.peer_stale_state_check_interval);
-    // duration allow a peer alive without leader in region, otherwise report the metrics and show peer as abnormal
-    config.raft_store.abnormal_leader_missing_duration = ReadableDuration(bt * 4 * MAX_ELECTION_TIME as _);
-    println!("abnormal_leader_missing_duration is {}", config.raft_store.abnormal_leader_missing_duration);
-    // duration allow a peer alive without leader in region, otherwise report the PD and delete itself(peer)
-    config.raft_store.max_leader_missing_duration = ReadableDuration(bt * 4 * MAX_ELECTION_TIME as _);
-    println!("max_leader_missing_duration is {}", config.raft_store.max_leader_missing_duration);
-    // Disable region split during recovering.
-    config.coprocessor.region_max_size = Some(ReadableSize::gb(MAX_REGION_SIZE));
-    config.coprocessor.region_split_size = ReadableSize::gb(MAX_REGION_SIZE);
-    config.coprocessor.region_max_keys = Some(MAX_SPLIT_KEY);
-    config.coprocessor.region_split_keys = Some(MAX_SPLIT_KEY);
-    // start a recovery service to interact with BR, BR will guilde the TiKV how to recovery data.
-    run_tikv(config); 
 }
 
 /// Run a TiKV server. Returns when the server is shutdown by the user, in which
@@ -227,6 +183,12 @@ const DEFAULT_MEMTRACE_FLUSH_INTERVAL: Duration = Duration::from_millis(1_000);
 const DEFAULT_ENGINE_METRICS_RESET_INTERVAL: Duration = Duration::from_millis(60_000);
 const DEFAULT_STORAGE_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
+// recovery mode parameter
+const MAX_ELECTION_TIME: usize = 24 * 60 * 60;
+
+//TODO, may deleted after ban the asksplit from PD
+const MAX_REGION_SIZE: u64 = 1024;
+const MAX_SPLIT_KEY: u64 = 1 << 31;
 /// A complete TiKV server.
 struct TiKvServer<ER: RaftEngine> {
     config: TiKvConfig,
@@ -253,6 +215,8 @@ struct TiKvServer<ER: RaftEngine> {
     background_worker: Worker,
     sst_worker: Option<Box<LazyWorker<String>>>,
     quota_limiter: Arc<QuotaLimiter>,
+    // for recovery tikv, we need a leader list before start tikv
+    region_leaders: Option<Vec<Leader>>,
 }
 
 struct TiKvEngines<EK: KvEngine, ER: RaftEngine> {
@@ -293,6 +257,18 @@ impl<ER: RaftEngine> TiKvServer<ER> {
         );
         let pd_client =
             Self::connect_to_pd_cluster(&mut config, env.clone(), Arc::clone(&security_mgr));
+        
+        // check if TiKV need to run in recovery mode
+        // TODO: let recovery_mode = block_on(pd_client.get_recovery_mode()).expect("failed to get recovery mode from PD");
+        config.recover_mode = true;
+        // Run a TiKV server in recovery mode
+        // recovery tikv from mountpoint of block level storage
+        
+        let mut leaders = Some(vec![]);
+        if config.recover_mode {
+            Self::enter_recovery_mode(&mut config);
+            leaders = Some(Self::recovery_meta(config.clone()));
+        }
 
         // Initialize and check config
         let cfg_controller = Self::init_config(config);
@@ -352,6 +328,7 @@ impl<ER: RaftEngine> TiKvServer<ER> {
             flow_info_receiver: None,
             sst_worker: None,
             quota_limiter,
+            region_leaders: leaders,
         }
     }
 
@@ -398,6 +375,51 @@ impl<ER: RaftEngine> TiKvServer<ER> {
         config.write_into_metrics();
 
         ConfigController::new(config)
+    }
+
+        /// Run a TiKV server in recovery mode
+    /// recovery mode include:
+    /// 1. no election happen between raft group
+    /// 2. peer valid during a recovery time even without leader in its region
+    /// 3. PD can not put any peer into tombstone
+    /// 4. must ensure all region data with ts less than backup ts (below commit index) are safe
+    fn enter_recovery_mode(
+        config: &mut TiKvConfig,
+    ) {
+        // TOOD: if we do not have to restart TiKV, then, we need exit the recovery mode and config the following parameter back
+        // disable some configuration to ban raft election etc.
+        // For block-level recovery, no raft peers can start a new election.
+        let bt = config.raft_store.raft_base_tick_interval.0;
+        println!("raft base tick is {:?}", bt);
+        config.raft_store.raft_election_timeout_ticks = MAX_ELECTION_TIME;
+        // time to check if peer alive without the leader, will not check peer during this time interval
+        config.raft_store.peer_stale_state_check_interval = ReadableDuration(bt * 4 * MAX_ELECTION_TIME as _);
+        println!("peer_stale_state_check_interval is {}", config.raft_store.peer_stale_state_check_interval);
+        // duration allow a peer alive without leader in region, otherwise report the metrics and show peer as abnormal
+        config.raft_store.abnormal_leader_missing_duration = ReadableDuration(bt * 4 * MAX_ELECTION_TIME as _);
+        println!("abnormal_leader_missing_duration is {}", config.raft_store.abnormal_leader_missing_duration);
+        // duration allow a peer alive without leader in region, otherwise report the PD and delete itself(peer)
+        config.raft_store.max_leader_missing_duration = ReadableDuration(bt * 4 * MAX_ELECTION_TIME as _);
+        println!("max_leader_missing_duration is {}", config.raft_store.max_leader_missing_duration);
+        // TODO: disabled split can be disabled by rejecting asksplit, this part of work can be implement in PD
+        // Disable region split during recovering
+        config.coprocessor.region_max_size = Some(ReadableSize::gb(MAX_REGION_SIZE));
+        config.coprocessor.region_split_size = ReadableSize::gb(MAX_REGION_SIZE);
+        config.coprocessor.region_max_keys = Some(MAX_SPLIT_KEY);
+        config.coprocessor.region_split_keys = Some(MAX_SPLIT_KEY);
+    }
+
+    fn recovery_meta(
+        config: TiKvConfig,
+    ) -> Vec<Leader> {
+ 
+        // start recovery meta service, notice this is block service,
+        // tikv is not allowed to startup until the recovery done,
+
+        // ensure recovery meta done, return the force leader list and leader commit_index
+        let region_leaders = recovery::recovery_meta::start_recovery(config);
+        // TODO: how to save regions 
+        region_leaders.unwrap()
     }
 
     fn connect_to_pd_cluster(
@@ -1210,13 +1232,16 @@ impl<ER: RaftEngine> TiKvServer<ER> {
         }
 
         // the present tikv in recovery mode, start recovery service
-        if self.config.recovery_mode {
+        if self.config.recover_mode {
             let recovery_service = RecoveryService::new(
                 // TODO: resued debug thread pool, we shall create a thread pool or reused someone?
                 //servers.server.get_debug_thread_pool().clone(),
                 engines.engines.clone(),
                 self.router.clone(),
+                self.region_leaders.clone(),
             );
+            // force region_leaders as leader
+            recovery_service.force_leader();
             if servers
                 .server
                 .register_service(create_recovery(recovery_service))

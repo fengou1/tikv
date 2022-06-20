@@ -113,13 +113,6 @@ fn main() {
                 .long_help("Set the PD endpoints to use. Use `,` to separate multiple PDs"),
         )
         .arg(
-            Arg::with_name("recovery-mode")
-                .required(false)
-                .long("recovery-mode")
-                .takes_value(true)
-                .help("Set TiKV into Recovery Mode for recoverying the block-level data"),
-        )
-        .arg(
             Arg::with_name("labels")
                 .long("labels")
                 .alias("label")
@@ -193,12 +186,5 @@ fn main() {
         process::exit(0)
     }
 
-    if config.recovery_mode {
-        println!("tikv recovery mode set to {}", config.recovery_mode);
-        server::server::recovery_tikv(config);
-        process::exit(0)
-    } else {
-        server::server::run_tikv(config);
-    }
-
+    server::server::run_tikv(config);
 }

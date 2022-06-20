@@ -1309,6 +1309,17 @@ where
             SignificantMsg::UnsafeRecoveryFillOutReport(syncer) => {
                 self.on_unsafe_recovery_fill_out_report(syncer)
             }
+            // TODO refactoring is necessary if this campaign is acceptable
+            SignificantMsg::Campaign => {
+                self.fsm.peer.raft_group.raft.become_candidate();
+                if let Err(e) = self.fsm.peer.raft_group.campaign() {
+                    error!("campaign manually fail";
+                        "region_id" => self.fsm.peer_id(),
+                        "err" => ?e);
+                } else {
+                    self.fsm.has_ready = true;
+                }
+            }
         }
     }
 
