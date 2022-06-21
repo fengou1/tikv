@@ -13,6 +13,7 @@ pub use recovery_meta::start_recovery;
 pub struct Leader {
     region_id: u64,
     // to be a leader until the apply index >= commit_index
+    // waitapply to the latest log 
     commit_index: u64,
 }
 

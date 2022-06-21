@@ -84,6 +84,7 @@ use super::{
 use crate::{
     coprocessor::{CoprocessorHost, RegionChangeEvent, RegionChangeReason, RoleChange},
     errors::RAFTSTORE_IS_BUSY,
+    router::RaftStoreRouter,
     store::{
         async_io::{write::WriteMsg, write_router::WriteRouter},
         fsm::{

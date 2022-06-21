@@ -1,48 +1,47 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 use engine_rocks::RocksEngine;
-use engine_traits::{Engines, MiscExt, RaftEngine};
+use engine_traits::{Engines, Mutable, Iterable, WriteBatchExt,RaftEngine, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use futures::{
     executor::{ThreadPool, ThreadPoolBuilder},
-    channel::oneshot,
-    future::{Future, FutureExt, TryFutureExt},
-    sink::SinkExt,
-    stream::{self, TryStreamExt},
 };
-use std::sync::mpsc::{sync_channel, SyncSender, Receiver};
-use std::thread;
+use std::collections::{HashSet};
+use std::sync::mpsc::{sync_channel};
+
 use grpcio::{
-    Error as GrpcError, RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink,
-    RequestStream,ClientStreamingSink,
+    RpcContext,  UnarySink,
 };
 use kvproto::{
-    recoverymetapb::{RegionMeta},
     recoverypb::{self, *},
 };
 use raftstore::{
     router::RaftStoreRouter,
-    store::msg::{Callback, SignificantMsg},
+    store::msg::{PeerMsg, Callback, SignificantMsg},
+    store::peer::{UnsafeRecoveryForceLeaderSyncer,UnsafeRecoveryWaitApplySyncer},
+    store::fsm::RaftRouter,
+    store::transport::SignificantRouter,
 };
 
+use txn_types::Key;
 use crate::Leader;
 
 /// Service handles the recovery messages from backup restore.
 #[derive(Clone)]
-pub struct RecoveryService<ER: RaftEngine, T: RaftStoreRouter<RocksEngine>> {
+pub struct RecoveryService<ER: RaftEngine> {
     threads: ThreadPool,
     engines: Engines<RocksEngine, ER>,
-    raft_router: T,
+    router: RaftRouter<RocksEngine, ER>,
     region_leaders: Option<Vec<Leader>>,
 }
 
-impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> RecoveryService<ER, T> {
+impl<ER: RaftEngine> RecoveryService<ER> {
     /// Constructs a new `Service` with `Engines`, a `RaftStoreRouter` and a `thread pool`.
     pub fn new(
         engines: Engines<RocksEngine, ER>,
-        raft_router: T,
+        router: RaftRouter<RocksEngine, ER>,
         region_leaders: Option<Vec<Leader>>,
 
-    ) -> RecoveryService<ER, T> {
+    ) -> RecoveryService<ER> {
         let props = tikv_util::thread_group::current_properties();
         let threads = ThreadPoolBuilder::new()
         // TODO: shall we do a const or config thread pool?
@@ -59,11 +58,12 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> RecoveryService<
         RecoveryService {
             threads,
             engines,
-            raft_router,
+            router,
             region_leaders,
         }
     }
 
+    // this is plan A, it is simply to send a Campaign and the check the leader
     pub fn force_leader(&self) {
         let region_leader = self.region_leaders.as_ref().unwrap();
         if region_leader.is_empty() {
@@ -71,7 +71,7 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> RecoveryService<
         }
 
         let leaders = region_leader.clone();
-        let raft_router = self.raft_router.clone();
+        let raft_router = self.router.clone();
         
         // TODO, we need a correct way to handle the log
         let th = std::thread::spawn(move || {
@@ -101,30 +101,141 @@ impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> RecoveryService<
                     println!("region {} is leader", rid.region_id);
                 }
             }
-    
             println!("all region state adjustments are done");
         });
         
         th.join().unwrap();
     }
 
+    // this is plan B, it is simply reused the unsafe online recovery, with failed store id = 0, the store id never be 0?
+    pub fn force_leader_with_failed_store(&self) {
+        let region_leader = self.region_leaders.as_ref().unwrap();
+        if region_leader.is_empty() {
+            return;
+        }
+
+        let leaders = region_leader.clone();
+        let raft_router = self.router.clone();
+        // is this way normal? looks like an edge case of rust, here we need a trait to structure
+        let router  = self.router.clone();
+        // TODO, we need a correct way to handle the log
+        let th = std::thread::spawn(move || {
+            println!("starting tikv success, start to force leader");
+            // Assume the store 0 is failed.
+            let mut failed_stores = HashSet::default();
+            failed_stores.insert(0);
+            let syncer = UnsafeRecoveryForceLeaderSyncer::new(
+                0, // no need the report
+                router.clone(),
+            );
+            
+            for leader in &leaders {
+
+                if let Err(e) = raft_router.significant_send(
+                    leader.region_id,
+                    SignificantMsg::EnterForceLeaderState {
+                        syncer: syncer.clone(),
+                        failed_stores: failed_stores.clone(),
+                    },
+                ) {
+                    println!("fail to send force leader message for recovery Error {}", e);
+                }
+            }
+            println!("all region state adjustments are done");
+        });
+        
+        th.join().unwrap();
+    }
 }
 
-impl<ER: RaftEngine, T: RaftStoreRouter<RocksEngine> + 'static> recoverypb::Recovery for RecoveryService<ER, T> {
-
-    fn check_raft_status(&mut self, _ctx: RpcContext, _req: GetRaftStatusRequest, _sink: UnarySink<GetRaftStatusResponse>) {
+impl<ER: RaftEngine> recoverypb::Recovery for RecoveryService<ER> {
+    fn check_raft_status(&mut self, _ctx: RpcContext, _req: GetRaftStatusRequest, sink: UnarySink<GetRaftStatusResponse>) {
         // TODO: implement a check raft status inteface
+        let router = self.router.clone();
         let handle_task = async move {
             println!("check_raft_status started");
+
+            let wait_apply = UnsafeRecoveryWaitApplySyncer::new(0, router.clone(), true);
+            router.broadcast_normal(|| {
+            PeerMsg::SignificantMsg(SignificantMsg::UnsafeRecoveryWaitApply(wait_apply.clone()))
+            });
+
+            let rep = GetRaftStatusResponse::default();
+            let _ = sink.success(rep).await;
         };
         self.threads.spawn_ok(handle_task);
 
     }
-    fn resolved_kv_data(&mut self, _ctx: RpcContext, _req: ResolvedRequest, _sink: UnarySink<ResolvedResponse>) {
-        // TODO: implement a resolve/delete data funciton
-        let handle_task = async move {
-            println!(" resovled_kv_data started")
+
+    fn resolved_kv_data(&mut self, _ctx: RpcContext, req: ResolvedRequest, sink: UnarySink<ResolvedResponse>)
+    {
+        // implement a resolve/delete data funciton
+        let ts = req.get_resolved_ts();
+
+        // resolved default cf by ts
+        let kv_db = self.engines.kv.clone();
+        let default_task = async move {
+            println!(" resovled_kv_data started");
+            let mut lock_key = Vec::new();
+            kv_db.scan_cf(
+                CF_DEFAULT,
+                keys::DATA_MIN_KEY,
+                keys::DATA_MAX_KEY,
+                false,
+                |key, _value| {
+                    let (_prefix, start_ts) = box_try!(Key::split_on_ts_for(key));
+        
+                    if start_ts.into_inner() <= ts {
+                        // Skip stale records.
+                        return Ok(true);
+                    }
+                    println!("data ts: {}", start_ts.into_inner());
+                    lock_key.push(key.to_owned());
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        
+            let mut kv_wb = kv_db.write_batch();
+            for k in lock_key {
+                println!("delete data key: {:?}", k);
+                kv_wb.delete_cf(CF_DEFAULT, &k.to_vec()).unwrap();
+            }
         };
-        self.threads.spawn_ok(handle_task);
+
+        // resolved write cf by ts
+        let write_db = self.engines.kv.clone();
+        let write_task = async move {
+            println!(" resovled_kv_data started");
+            let mut lock_key = Vec::new();
+            write_db.scan_cf(
+                CF_WRITE,
+                keys::DATA_MIN_KEY,
+                keys::DATA_MAX_KEY,
+                false,
+                |key, _value| {
+                    let (_prefix, start_ts) = box_try!(Key::split_on_ts_for(key));
+        
+                    if start_ts.into_inner() <= ts {
+                        // Skip stale records.
+                        return Ok(true);
+                    }
+                    println!("data ts: {}", start_ts.into_inner());
+                    lock_key.push(key.to_owned());
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        
+            let mut kv_wb = write_db.write_batch();
+            for k in lock_key {
+                println!("delete data key: {:?}", k);
+                kv_wb.delete_cf(CF_WRITE, &k.to_vec()).unwrap();
+            }
+            let _ = sink.success(ResolvedResponse::default()).await;
+        };
+
+        self.threads.spawn_ok(default_task);
+        self.threads.spawn_ok(write_task);
     }
 }

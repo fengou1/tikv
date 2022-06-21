@@ -4381,6 +4381,7 @@ dependencies = [
  "tikv_alloc",
  "tikv_util",
  "toml",
+ "txn_types",
 ]
 
 [[package]]

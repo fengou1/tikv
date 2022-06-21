@@ -1,17 +1,16 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{error::Error as StdError,
-    net::{SocketAddr},
-    sync::{Arc, mpsc},
+    net::SocketAddr,
+    sync::Arc,
     str::FromStr,
-    result,
+    collections::HashMap,
 };
 
-use std::collections::HashMap;
 use futures::executor::block_on;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use futures::sink::SinkExt;
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, StreamExt};
 use tikv::config::TiKvConfig;
 use encryption_export::data_key_manager_from_config;
 use engine_rocks::raw_util::new_engine_opt;
@@ -21,11 +20,11 @@ use engine_traits::{
     Engines, Iterable, Peekable, RaftEngine, CF_RAFT,
 };
 
-use grpcio::{ChannelBuilder, Environment, RequestStream, RpcContext, ServerBuilder, WriteFlags};
+use grpcio::{ChannelBuilder, Environment, ServerBuilder, WriteFlags};
 use kvproto::raft_serverpb::{PeerState, RaftApplyState, RaftLocalState, RegionLocalState};
 
 use kvproto::recoverymetapb_grpc::{RecoveryMeta, create_recovery_meta};
-use kvproto::recoverymetapb::{self, *};
+use kvproto::recoverymetapb::{*};
 use thiserror::Error;
 use crate::Leader;
 
@@ -76,18 +75,18 @@ pub fn start_recovery(config: TiKvConfig) -> Result<Vec<Leader>, Error>
         let cmds = match rx.recv() {
             //TODO, what about the leaders list is None
             Ok(x) => x,
-            Err(e) => {
+            Err(_e) => {
                 println!("get leader list failure.");
                 return Err(Error::NotFound(format!("Received leader error.")));
             }
         };
 
-        // shutdown the service
+        // shutdown the service, will this enough to release the socket resource?
         let _ = block_on(server.shutdown());
         // TODO: part I, do some handling for local engine
         // TODO: part II, return the leader list to TiKV and start TiKV to force leader.
         let mut leaders = Vec::new();
-        for (idx, cmd) in cmds.iter() {
+        for (_idx, cmd) in cmds.iter() {
             if cmd.as_leader {
                 leaders.push(Leader{region_id:cmd.get_region_id(), commit_index: cmd.get_leader_commit_index(),});
             }
@@ -106,12 +105,15 @@ pub struct RecoverMetaSerivce {
 
 impl RecoverMetaSerivce {
     pub fn new(config: TiKvConfig, tx: SyncSender<HashMap::<u64, RecoveryCmdRequest>>) -> RecoverMetaSerivce{
-
         RecoverMetaSerivce {
             config: config,
             tx: tx,
-            //engine_service: Box::new(local_engine_service),
         }
+    }
+
+    pub fn recover_raft_state(&self){
+        //TODO: the raft state stay in normal states, but the raft index/term looks invalid, it may need to modified the rafe state.
+        println!("recover_raft_state");
     }
 }
 
@@ -143,7 +145,6 @@ impl RecoveryMeta for RecoverMetaSerivce {
     fn recovery_cmd(&mut self, ctx: ::grpcio::RpcContext, mut stream: ::grpcio::RequestStream<RecoveryCmdRequest>, sink: ::grpcio::ClientStreamingSink<RecoveryCmdResponse>) {
         println!("start to recovery the region meta");
         //wait for the recovery command to recover the raft state, late on, we could bring all valid region back online to algin the log.
-        //TODO: the raft state stay in normal states, but the raft index/term looks invalid, it may need to modified the rafe state.
         let tx = self.tx.clone();
 
         let task = async move {
@@ -152,7 +153,6 @@ impl RecoveryMeta for RecoverMetaSerivce {
                 let req = req.map_err(|e| eprintln!("rpc recv fail: {}", e)).unwrap();
                 assert!(leaders.insert(req.region_id, req).is_none());
             }
-
             tx.send(leaders).unwrap();
             let _ = sink.success(RecoveryCmdResponse::default()).await;
         };

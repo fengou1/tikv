@@ -9,13 +9,14 @@ pub mod msg;
 pub mod transport;
 #[macro_use]
 pub mod util;
+pub mod peer;
 
 mod async_io;
 mod bootstrap;
 mod compaction_guard;
 mod hibernate_state;
 mod local_metrics;
-mod peer;
+//mod peer;
 mod peer_storage;
 mod read_queue;
 mod region_snapshot;
@@ -42,7 +43,7 @@ pub use self::{
         PeerTick, RaftCmdExtraOpts, RaftCommand, ReadCallback, ReadResponse, SignificantMsg,
         StoreMsg, StoreTick, WriteCallback, WriteResponse,
     },
-    peer::{AbstractPeer, Peer, PeerStat, ProposalContext, RequestInspector, RequestPolicy},
+    peer::{AbstractPeer, Peer, PeerStat, ProposalContext, RequestInspector, RequestPolicy, UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryWaitApplySyncer},
     peer_storage::{
         clear_meta, do_snapshot, write_initial_apply_state, write_initial_raft_state,
         write_peer_state, PeerStorage, RaftlogFetchResult, SnapState, INIT_EPOCH_CONF_VER,
