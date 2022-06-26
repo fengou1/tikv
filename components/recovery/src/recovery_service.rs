@@ -24,6 +24,7 @@ use raftstore::{
 
 use txn_types::Key;
 use crate::Leader;
+use tikv::storage::mvcc::{Lock};
 
 /// Service handles the recovery messages from backup restore.
 #[derive(Clone)]
@@ -116,7 +117,6 @@ impl<ER: RaftEngine> RecoveryService<ER> {
 
         let leaders = region_leader.clone();
         let raft_router = self.router.clone();
-        // is this way normal? looks like an edge case of rust, here we need a trait to structure
         let router  = self.router.clone();
         // TODO, we need a correct way to handle the log
         let th = std::thread::spawn(move || {
@@ -166,72 +166,65 @@ impl<ER: RaftEngine> recoverypb::Recovery for RecoveryService<ER> {
         self.threads.spawn_ok(handle_task);
 
     }
-
+    // currently we only delete the lock cf and write cf, the data cf will not delete in this version.
     fn resolved_kv_data(&mut self, _ctx: RpcContext, req: ResolvedRequest, sink: UnarySink<ResolvedResponse>)
     {
         // implement a resolve/delete data funciton
-        let ts = req.get_resolved_ts();
+        let resolved_ts = req.get_resolved_ts();
 
         // resolved default cf by ts
         let kv_db = self.engines.kv.clone();
         let default_task = async move {
             println!(" resovled_kv_data started");
-            let mut lock_key = Vec::new();
+            // refer to restore_kv_meta, not sure if we can delete when we iterate the kv_db
+            let mut kv_wb = kv_db.write_batch();
             kv_db.scan_cf(
-                CF_DEFAULT,
+                CF_LOCK,
                 keys::DATA_MIN_KEY,
                 keys::DATA_MAX_KEY,
                 false,
-                |key, _value| {
-                    let (_prefix, start_ts) = box_try!(Key::split_on_ts_for(key));
-        
-                    if start_ts.into_inner() <= ts {
-                        // Skip stale records.
+                |key, value| {
+                    println!("lock key : {:?}", key);
+
+                    let lock = box_try!(Lock::parse(value));
+                    if lock.ts.into_inner() <= resolved_ts {
+                        println!("the resolved_ts has issue during the backup");
+                        // TODO: panic may necessary, here.
                         return Ok(true);
                     }
-                    println!("data ts: {}", start_ts.into_inner());
-                    lock_key.push(key.to_owned());
+
+                    kv_wb.delete(key).unwrap();
                     Ok(true)
                 },
             )
             .unwrap();
-        
-            let mut kv_wb = kv_db.write_batch();
-            for k in lock_key {
-                println!("delete data key: {:?}", k);
-                kv_wb.delete_cf(CF_DEFAULT, &k.to_vec()).unwrap();
-            }
         };
 
         // resolved write cf by ts
         let write_db = self.engines.kv.clone();
+        let mut kv_wb = write_db.write_batch();
         let write_task = async move {
-            println!(" resovled_kv_data started");
-            let mut lock_key = Vec::new();
+            println!(" resolve_kv_data started");
             write_db.scan_cf(
                 CF_WRITE,
                 keys::DATA_MIN_KEY,
                 keys::DATA_MAX_KEY,
                 false,
                 |key, _value| {
-                    let (_prefix, start_ts) = box_try!(Key::split_on_ts_for(key));
+                    let (_prefix, commit_ts) = box_try!(Key::split_on_ts_for(key));
         
-                    if start_ts.into_inner() <= ts {
+                    if commit_ts.into_inner() <= resolved_ts {
                         // Skip stale records.
                         return Ok(true);
                     }
-                    println!("data ts: {}", start_ts.into_inner());
-                    lock_key.push(key.to_owned());
+                    println!("write ts: {}", commit_ts.into_inner());
+                    
+                    kv_wb.delete_cf(CF_WRITE, key).unwrap();
                     Ok(true)
                 },
             )
             .unwrap();
-        
-            let mut kv_wb = write_db.write_batch();
-            for k in lock_key {
-                println!("delete data key: {:?}", k);
-                kv_wb.delete_cf(CF_WRITE, &k.to_vec()).unwrap();
-            }
+    
             let _ = sink.success(ResolvedResponse::default()).await;
         };
 
