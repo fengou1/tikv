@@ -2616,7 +2616,7 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.2"
-source = "git+https://github.com/fengou1/kvproto?branch=ebs#06416f78bc1188353eb2c0f4200926b16e2c3459"
+source = "git+https://github.com/fengou1/kvproto?branch=ebs#02f45b9a1b67b9f654ed8882c18a12c41205b961"
 dependencies = [
  "futures 0.3.15",
  "grpcio",
@@ -4364,6 +4364,7 @@ dependencies = [
 name = "recovery"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "encryption",
  "encryption_export",
  "engine_rocks",
@@ -4372,6 +4373,7 @@ dependencies = [
  "grpcio",
  "keys",
  "kvproto",
+ "pd_client",
  "protobuf",
  "raft_log_engine",
  "raftstore",

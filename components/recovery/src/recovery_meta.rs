@@ -20,8 +20,10 @@ use engine_traits::{
     Engines, Iterable, Peekable, RaftEngine, CF_RAFT,
 };
 
+use pd_client::{PdClient, RpcClient};
 use grpcio::{ChannelBuilder, Environment, ServerBuilder, WriteFlags};
-use kvproto::raft_serverpb::{PeerState, RaftApplyState, RaftLocalState, RegionLocalState};
+use kvproto::raft_serverpb::{PeerState, RaftApplyState, RaftLocalState, RegionLocalState, StoreIdent};
+use kvproto::metapb;
 
 use kvproto::recoverymetapb_grpc::{RecoveryMeta, create_recovery_meta};
 use kvproto::recoverymetapb::{*};
@@ -40,19 +42,57 @@ pub enum Error {
     #[error("{0:?}")]
     Other(#[from] Box<dyn StdError + Sync + Send>),
 }
+// BR get the store info from PD when register had done
+// the node start will update the store with more info
+pub fn registry_store_to_pd(config: TiKvConfig, pd_client: Arc<RpcClient>) {
+    let server_config = config.clone();
+    let local_engine_service = create_local_engine_service(&server_config); 
+    let store_id = local_engine_service.unwrap().get_store_id().unwrap();
+    let mut store = metapb::Store::default();
+        store.set_id(store_id);
+        if server_config.server.advertise_addr.is_empty() {
+            store.set_address(server_config.server.addr.clone());
+        } else {
+            store.set_address(server_config.server.advertise_addr.clone())
+        }
+        if server_config.server.advertise_status_addr.is_empty() {
+            store.set_status_address(server_config.server.status_addr.clone());
+        } else {
+            store.set_status_address(server_config.server.advertise_status_addr.clone())
+        }
+        store.set_version(env!("CARGO_PKG_VERSION").to_string());
 
+        if let Ok(path) = std::env::current_exe() {
+            if let Some(path) = path.parent() {
+                store.set_deploy_path(path.to_string_lossy().to_string());
+            }
+        };
 
-pub fn start_recovery(config: TiKvConfig) -> Result<Vec<Leader>, Error>
+        store.set_start_timestamp(chrono::Local::now().timestamp());
+        store.set_git_hash(
+            option_env!("TIKV_BUILD_GIT_HASH")
+                .unwrap_or("Unknown git hash")
+                .to_string(),
+        );
+
+    //TODO: is there any thing to do?
+    let _status = pd_client.put_store(store.clone());
+    //info!("initializing replication mode"; "status" => ?status, "store_id" => self.store.id);
+}
+// Notice: the start_recovery will start a exclusive gRPC serivce, the purpose is to handle the data before tikv node started
+// Why not use TiKV gRPC service? gRPC service start too late, and really hard to reuse the exisited gRPC service.
+pub fn start_recovery(config: TiKvConfig, pd_client: Arc<RpcClient>) -> Result<Vec<Leader>, Error>
 {
     // TODO init a separete log file for recording meta and recovery meta log.
     //let _guard = log_util::init_log(None);
     let env = Arc::new(Environment::new(1));
     let (tx, rx) = sync_channel::<HashMap::<u64, RecoveryCmdRequest>>(1);
 
-    let db_config = config.clone();
-    let recovery = RecoverMetaSerivce::new(db_config, tx);
+    let recovery = RecoverMetaSerivce::new(config.clone(), tx);
     let service = create_recovery_meta(recovery);
     
+    // registry the store to PD
+    registry_store_to_pd(config.clone(), pd_client);
     // TODO, shall we limit the memory usage
     //let quota = ResourceQuota::new(Some("RecoveryMetaServerQuota")).resize_memory(1024 * 1024);
     let ch_builder = ChannelBuilder::new(env.clone());
@@ -81,8 +121,6 @@ pub fn start_recovery(config: TiKvConfig) -> Result<Vec<Leader>, Error>
             }
         };
 
-        // shutdown the service, will this enough to release the socket resource?
-        let _ = block_on(server.shutdown());
         // TODO: part I, do some handling for local engine
         // TODO: part II, return the leader list to TiKV and start TiKV to force leader.
         let mut leaders = Vec::new();
@@ -91,6 +129,9 @@ pub fn start_recovery(config: TiKvConfig) -> Result<Vec<Leader>, Error>
                 leaders.push(Leader{region_id:cmd.get_region_id(), commit_index: cmd.get_leader_commit_index(),});
             }
         }
+
+        // shutdown the service, will this enough to release the socket resource?
+        let _ = block_on(server.shutdown());
         Ok(leaders)
 }
 
@@ -98,13 +139,12 @@ pub fn start_recovery(config: TiKvConfig) -> Result<Vec<Leader>, Error>
 pub struct RecoverMetaSerivce {
     config: TiKvConfig,
     tx: SyncSender<HashMap::<u64, RecoveryCmdRequest>>,
-    //engine_service: Box<dyn LocalEngineService>,
-
 }
 
 
 impl RecoverMetaSerivce {
     pub fn new(config: TiKvConfig, tx: SyncSender<HashMap::<u64, RecoveryCmdRequest>>) -> RecoverMetaSerivce{
+        //1. regrestry the store into PD, so that BR can reach the TiKV via PD GetAllStores
         RecoverMetaSerivce {
             config: config,
             tx: tx,
@@ -161,7 +201,106 @@ impl RecoveryMeta for RecoverMetaSerivce {
     }
 }
 
-// BR will get all information for this to decided which peer shall be tombstone
+// the service to operator the local engines
+pub trait LocalEngineService{
+    // the function is to read region meta from rocksdb and raft engine
+    fn get_local_region_meta(&self) -> Vec<RegionMeta>;
+    //fn recovery_raft_state(&self);
+    fn get_store_id(&self) -> Result<u64, String>;
+}
+
+
+impl<ER: RaftEngine>  LocalEngineService for LocalEngines<ER> {
+    // the function is to read region meta from rocksdb and raft engine
+    fn get_local_region_meta(&self) -> Vec<RegionMeta> {
+        // read the local region info
+        let local_regions = self.get_regions_info();
+        let region_metas = local_regions
+        .iter()
+        .map(|x| x.to_region_meta())
+        .collect::<Vec<_>>();
+
+        println!("region metas to report:");
+        for meta in &region_metas {
+            println!("\t{:?}", meta);
+            println!("{}", meta.get_tombstone());
+        }
+        
+        return region_metas;
+    }
+    // return cluster id and store id for registry the store to PD
+    fn get_store_id(&self) -> Result<u64, String> {
+        let res = self.get_engine().kv.get_msg::<StoreIdent>(keys::STORE_IDENT_KEY)?;
+        if res.is_none() {
+            return Ok(0);
+        }
+
+        let ident = res.unwrap();
+        let store_id = ident.get_store_id();
+        if store_id == 0 {
+            println!("invalid store to report");
+        }
+
+        Ok(store_id)
+    }
+}
+
+// create a engine reader, before that we need init engines firstly
+// Notice: raft log engine could be a raft engine or rocksdb
+pub fn create_local_engine_service(config: &TiKvConfig) -> Result<Box<dyn LocalEngineService>, String> {
+    // init env for init kv db and raft engine
+    let key_manager =
+        data_key_manager_from_config(&config.security.encryption, &config.storage.data_dir)
+            .map_err(|e| format!("init encryption manager: {}", e))?
+            .map(Arc::new);
+    let env = config
+        .build_shared_rocks_env(key_manager.clone(), None)
+        .map_err(|e| format!("build shared rocks env: {}", e))?;
+    let block_cache = config.storage.block_cache.build_shared_cache();
+
+    // init rocksdb / kv db
+    let mut db_opts = config.rocksdb.build_opt();
+    db_opts.set_env(env.clone());
+    let cf_opts = config
+        .rocksdb
+        .build_cf_opts(&block_cache, None, config.storage.api_version());
+    let db_path = config
+        .infer_kv_engine_path(None)
+        .map_err(|e| format!("infer kvdb path: {}", e))?;
+    println!("kvdb path: {:?}", db_path);
+    let kv_db =
+        new_engine_opt(&db_path, db_opts, cf_opts).map_err(|e| format!("create kvdb: {}", e))?;
+
+    let mut kv_db = RocksEngine::from_db(Arc::new(kv_db));
+    let shared_block_cache = block_cache.is_some();
+    kv_db.set_shared_block_cache(shared_block_cache);
+
+    // init raft engine, either is rocksdb or raft engine
+    if !config.raft_engine.enable { // rocksdb
+        let mut raft_db_opts = config.raftdb.build_opt();
+        raft_db_opts.set_env(env);
+        let raft_db_cf_opts = config.raftdb.build_cf_opts(&block_cache);
+        let raft_path = config.infer_raft_db_path(None).map_err(|e| format!("infer raftdb path: {}", e))?;
+        println!("raftdb path: {:?}", raft_path);
+        let raft_db = new_engine_opt(&raft_path, raft_db_opts, raft_db_cf_opts).map_err(|e| format!("create kvdb: {}", e))?;
+        let mut raft_db = RocksEngine::from_db(Arc::new(raft_db));
+        raft_db.set_shared_block_cache(shared_block_cache);
+        let local_engines = LocalEngines::new(Engines::new(kv_db, raft_db));
+        Ok(Box::new(local_engines) as Box<dyn LocalEngineService>)
+    } else { // raft engine
+        let mut cfg = config.raft_engine.config();
+        cfg.dir = config.infer_raft_engine_path(None).unwrap();
+        if !RaftLogEngine::exists(&cfg.dir) {
+            println!("raft engine not exists: {}", cfg.dir);
+            tikv_util::logger::exit_process_gracefully(-1);
+        }
+        println!("raft engine path: {:?}", cfg.dir);
+        let raft_db = RaftLogEngine::new(cfg, key_manager, None /*io_rate_limiter*/).unwrap();
+        let local_engines = LocalEngines::new(Engines::new(kv_db, raft_db));
+        Ok(Box::new(local_engines) as Box<dyn LocalEngineService>)
+    }
+}
+
 
 /// Describes the meta information of a Local Region Peer.
 #[derive(PartialEq, Debug, Default)]
@@ -289,90 +428,4 @@ impl<ER: RaftEngine> LocalEngines<ER> {
         }
         region_objects
     }
-
 }
-
-// the service to operator the local data
-pub trait LocalEngineService {
-    // the function is to read region meta from rocksdb and raft engine
-    fn get_local_region_meta(&self) -> Vec<RegionMeta>;
-    //fn recovery_raft_state(&self);
-}
-
-
-impl<ER: RaftEngine>  LocalEngineService for LocalEngines<ER> {
-    // the function is to read region meta from rocksdb and raft engine
-    fn get_local_region_meta(&self) -> Vec<RegionMeta> {
-        // read the local region info
-        let local_regions = self.get_regions_info();
-        let region_metas = local_regions
-        .iter()
-        .map(|x| x.to_region_meta())
-        .collect::<Vec<_>>();
-
-        println!("region metas to report:");
-        for meta in &region_metas {
-            println!("\t{:?}", meta);
-            println!("{}", meta.get_tombstone());
-        }
-        
-        return region_metas;
-    }
-}
-
-// create a engine reader, before that we need init engines firstly
-// Notice: raft log engine could be a raft engine or rocksdb
-pub fn create_local_engine_service(config: &TiKvConfig) -> Result<Box<dyn LocalEngineService>, String> {
-    // init env for init kv db and raft engine
-    let key_manager =
-        data_key_manager_from_config(&config.security.encryption, &config.storage.data_dir)
-            .map_err(|e| format!("init encryption manager: {}", e))?
-            .map(Arc::new);
-    let env = config
-        .build_shared_rocks_env(key_manager.clone(), None)
-        .map_err(|e| format!("build shared rocks env: {}", e))?;
-    let block_cache = config.storage.block_cache.build_shared_cache();
-
-    // init rocksdb / kv db
-    let mut db_opts = config.rocksdb.build_opt();
-    db_opts.set_env(env.clone());
-    let cf_opts = config
-        .rocksdb
-        .build_cf_opts(&block_cache, None, config.storage.api_version());
-    let db_path = config
-        .infer_kv_engine_path(None)
-        .map_err(|e| format!("infer kvdb path: {}", e))?;
-    println!("kvdb path: {:?}", db_path);
-    let kv_db =
-        new_engine_opt(&db_path, db_opts, cf_opts).map_err(|e| format!("create kvdb: {}", e))?;
-
-    let mut kv_db = RocksEngine::from_db(Arc::new(kv_db));
-    let shared_block_cache = block_cache.is_some();
-    kv_db.set_shared_block_cache(shared_block_cache);
-
-    // init raft engine, either is rocksdb or raft engine
-    if !config.raft_engine.enable { // rocksdb
-        let mut raft_db_opts = config.raftdb.build_opt();
-        raft_db_opts.set_env(env);
-        let raft_db_cf_opts = config.raftdb.build_cf_opts(&block_cache);
-        let raft_path = config.infer_raft_db_path(None).map_err(|e| format!("infer raftdb path: {}", e))?;
-        println!("raftdb path: {:?}", raft_path);
-        let raft_db = new_engine_opt(&raft_path, raft_db_opts, raft_db_cf_opts).map_err(|e| format!("create kvdb: {}", e))?;
-        let mut raft_db = RocksEngine::from_db(Arc::new(raft_db));
-        raft_db.set_shared_block_cache(shared_block_cache);
-        let local_engines = LocalEngines::new(Engines::new(kv_db, raft_db));
-        Ok(Box::new(local_engines) as Box<dyn LocalEngineService>)
-    } else { // raft engine
-        let mut cfg = config.raft_engine.config();
-        cfg.dir = config.infer_raft_engine_path(None).unwrap();
-        if !RaftLogEngine::exists(&cfg.dir) {
-            println!("raft engine not exists: {}", cfg.dir);
-            tikv_util::logger::exit_process_gracefully(-1);
-        }
-        println!("raft engine path: {:?}", cfg.dir);
-        let raft_db = RaftLogEngine::new(cfg, key_manager, None /*io_rate_limiter*/).unwrap();
-        let local_engines = LocalEngines::new(Engines::new(kv_db, raft_db));
-        Ok(Box::new(local_engines) as Box<dyn LocalEngineService>)
-   }
-}
-

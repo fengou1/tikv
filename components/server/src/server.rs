@@ -260,14 +260,14 @@ impl<ER: RaftEngine> TiKvServer<ER> {
         
         // check if TiKV need to run in recovery mode
         // TODO: let recovery_mode = block_on(pd_client.get_recovery_mode()).expect("failed to get recovery mode from PD");
-        config.recover_mode = true;
+        config.recovery_mode = true;
         // Run a TiKV server in recovery mode
         // recovery tikv from mountpoint of block level storage
         
         let mut leaders = Some(vec![]);
-        if config.recover_mode {
+        if config.recovery_mode {
             Self::enter_recovery_mode(&mut config);
-            leaders = Some(Self::recovery_meta(config.clone()));
+            leaders = Some(Self::recover_meta(config.clone(), pd_client.clone()));
         }
 
         // Initialize and check config
@@ -377,7 +377,7 @@ impl<ER: RaftEngine> TiKvServer<ER> {
         ConfigController::new(config)
     }
 
-        /// Run a TiKV server in recovery mode
+    /// Run a TiKV server in recovery mode
     /// recovery mode include:
     /// 1. no election happen between raft group
     /// 2. peer valid during a recovery time even without leader in its region
@@ -409,15 +409,16 @@ impl<ER: RaftEngine> TiKvServer<ER> {
         config.coprocessor.region_split_keys = Some(MAX_SPLIT_KEY);
     }
 
-    fn recovery_meta(
+    fn recover_meta(
         config: TiKvConfig,
+        pd_client: Arc<RpcClient>,
     ) -> Vec<Leader> {
  
         // start recovery meta service, notice this is block service,
         // tikv is not allowed to startup until the recovery done,
 
-        // ensure recovery meta done, return the force leader list and leader commit_index
-        let region_leaders = recovery::recovery_meta::start_recovery(config);
+        // ensure recover meta done, return the force leader list and leader commit_index
+        let region_leaders = recovery::recovery_meta::start_recovery(config, pd_client);
         // TODO: how to save regions 
         region_leaders.unwrap()
     }
@@ -1232,7 +1233,7 @@ impl<ER: RaftEngine> TiKvServer<ER> {
         }
 
         // the present tikv in recovery mode, start recovery service
-        if self.config.recover_mode {
+        if self.config.recovery_mode {
             let recovery_service = RecoveryService::new(
                 // TODO: resued debug thread pool, we shall create a thread pool or reused someone?
                 //servers.server.get_debug_thread_pool().clone(),

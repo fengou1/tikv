@@ -21,7 +21,9 @@ tikv = { path = "../.." }
 tikv_alloc = { path = "../../components/tikv_alloc" }
 tikv_util = { path = "../../components/tikv_util", default-features = false }
 txn_types = { path = "../../components/txn_types", default-features = false }
+pd_client = { path = "../pd_client", default-features = false }
 raft_log_engine = { path = "../raft_log_engine", default-features = false }
 structopt = "0.3"
 toml = "0.5"
 thiserror = "1.0"
+chrono = "0.4"

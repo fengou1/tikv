@@ -78,7 +78,7 @@ impl<ER: RaftEngine> RecoveryService<ER> {
         let th = std::thread::spawn(move || {
             println!("starting tikv success, start to force leader");
     
-            //TODO: it looks more effective that we directly send a campaign to region and check it by LeaderCallback.
+            //TODO: it looks more effective that we directly send a campaign to region and then check it by LeaderCallback.
             let mut rxs = Vec::with_capacity(leaders.len());
             for leader in &leaders {
                 if let Err(e) = raft_router.significant_send(leader.region_id, SignificantMsg::Campaign) {
@@ -108,7 +108,7 @@ impl<ER: RaftEngine> RecoveryService<ER> {
         th.join().unwrap();
     }
 
-    // this is plan B, it is simply reused the unsafe online recovery, with failed store id = 0, the store id never be 0?
+    // this is plan B, it is simply reuse the unsafe online recovery, with failed store id = 0, the store id never be 0?
     pub fn force_leader_with_failed_store(&self) {
         let region_leader = self.region_leaders.as_ref().unwrap();
         if region_leader.is_empty() {
@@ -121,7 +121,7 @@ impl<ER: RaftEngine> RecoveryService<ER> {
         // TODO, we need a correct way to handle the log
         let th = std::thread::spawn(move || {
             println!("starting tikv success, start to force leader");
-            // Assume the store 0 is failed.
+            // Assume the store 0 is failed for reusing online unsafe recovery
             let mut failed_stores = HashSet::default();
             failed_stores.insert(0);
             let syncer = UnsafeRecoveryForceLeaderSyncer::new(
@@ -167,7 +167,7 @@ impl<ER: RaftEngine> recoverypb::Recovery for RecoveryService<ER> {
 
     }
     // currently we only delete the lock cf and write cf, the data cf will not delete in this version.
-    fn resolved_kv_data(&mut self, _ctx: RpcContext, req: ResolvedRequest, sink: UnarySink<ResolvedResponse>)
+    fn resolve_kv_data(&mut self, _ctx: RpcContext, req: ResolveRequest, sink: UnarySink<ResolveResponse>)
     {
         // implement a resolve/delete data funciton
         let resolved_ts = req.get_resolved_ts();
@@ -225,7 +225,7 @@ impl<ER: RaftEngine> recoverypb::Recovery for RecoveryService<ER> {
             )
             .unwrap();
     
-            let _ = sink.success(ResolvedResponse::default()).await;
+            let _ = sink.success(ResolveResponse::default()).await;
         };
 
         self.threads.spawn_ok(default_task);
