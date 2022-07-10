@@ -9,13 +9,6 @@ extern crate tikv_util;
 //pub use recovery_meta::RecoverMetaSerivce;
 pub use recovery_service::RecoveryService;
 pub use recovery_meta::start_recovery;
-#[derive(Clone)]
-pub struct Leader {
-    region_id: u64,
-    // to be a leader until the apply index >= commit_index
-    // waitapply to the latest log 
-    commit_index: u64,
-}
 
 #[cfg(test)]
 mod tests {

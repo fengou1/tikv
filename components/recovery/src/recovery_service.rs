@@ -3,16 +3,22 @@
 use engine_rocks::RocksEngine;
 use engine_traits::{Engines, Mutable, Iterable, WriteBatchExt,RaftEngine, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use futures::{
-    executor::{ThreadPool, ThreadPoolBuilder},
+    executor::{ThreadPool, ThreadPoolBuilder, block_on},
 };
+
+use futures::stream::{self, StreamExt};
 use std::collections::{HashSet};
 use std::sync::mpsc::{sync_channel};
 
 use grpcio::{
-    RpcContext,  UnarySink,
+    RpcContext,
+    UnarySink,
+    RequestStream,
+    ClientStreamingSink,
+
 };
 use kvproto::{
-    recoverypb::{self, *},
+    recoverdatapb::{self, *},
 };
 use raftstore::{
     router::RaftStoreRouter,
@@ -23,7 +29,6 @@ use raftstore::{
 };
 
 use txn_types::Key;
-use crate::Leader;
 use tikv::storage::mvcc::{Lock};
 
 /// Service handles the recovery messages from backup restore.
@@ -32,7 +37,6 @@ pub struct RecoveryService<ER: RaftEngine> {
     threads: ThreadPool,
     engines: Engines<RocksEngine, ER>,
     router: RaftRouter<RocksEngine, ER>,
-    region_leaders: Option<Vec<Leader>>,
 }
 
 impl<ER: RaftEngine> RecoveryService<ER> {
@@ -40,8 +44,6 @@ impl<ER: RaftEngine> RecoveryService<ER> {
     pub fn new(
         engines: Engines<RocksEngine, ER>,
         router: RaftRouter<RocksEngine, ER>,
-        region_leaders: Option<Vec<Leader>>,
-
     ) -> RecoveryService<ER> {
         let props = tikv_util::thread_group::current_properties();
         let threads = ThreadPoolBuilder::new()
@@ -60,46 +62,40 @@ impl<ER: RaftEngine> RecoveryService<ER> {
             threads,
             engines,
             router,
-            region_leaders,
         }
     }
 
-    // this is plan A, it is simply to send a Campaign and the check the leader
-    pub fn force_leader(&self) {
-        let region_leader = self.region_leaders.as_ref().unwrap();
-        if region_leader.is_empty() {
-            return;
-        }
-
-        let leaders = region_leader.clone();
+    // it is simply to send a Campaign and the check the leader
+    pub fn force_leader(&self, region_leaders: Vec<u64>) {
+        let leaders = region_leaders.clone();
         let raft_router = self.router.clone();
         
-        // TODO, we need a correct way to handle the log
         let th = std::thread::spawn(move || {
             println!("starting tikv success, start to force leader");
-    
-            //TODO: it looks more effective that we directly send a campaign to region and then check it by LeaderCallback.
+            //it looks more effective that we directly send a campaign to region and then check it by LeaderCallback.
             let mut rxs = Vec::with_capacity(leaders.len());
-            for leader in &leaders {
-                if let Err(e) = raft_router.significant_send(leader.region_id, SignificantMsg::Campaign) {
-                    println!("region {} fails to campaign: {}", leader.region_id, e);
+            for &region_id in &leaders {
+                if let Err(e) = raft_router.significant_send(region_id, SignificantMsg::Campaign) {
+                    //TODO: retry may necessay
+                    println!("region {} fails to campaign: {}", region_id, e);
                     continue;
                 } else {
-                    println!("region {} starts to campaign", leader.region_id);
+                    println!("region {} starts to campaign", region_id);
                 }
     
                 let (tx, rx) = sync_channel(1);
                 let cb = Callback::Read(Box::new(move |_| tx.send(1).unwrap()));
                 raft_router
-                    .significant_send(leader.region_id, SignificantMsg::LeaderCallback(cb))
+                    .significant_send(region_id, SignificantMsg::LeaderCallback(cb))
                     .unwrap();
                 rxs.push(Some(rx));
             }
+            
             // leader is campaign and be ensured as leader
             for (rid, rx) in leaders.iter().zip(rxs) {
                 if let Some(rx) = rx {
                     let _ = rx.recv().unwrap();
-                    println!("region {} is leader", rid.region_id);
+                    println!("region {} is leader", rid);
                 }
             }
             println!("all region state adjustments are done");
@@ -108,64 +104,39 @@ impl<ER: RaftEngine> RecoveryService<ER> {
         th.join().unwrap();
     }
 
-    // this is plan B, it is simply reuse the unsafe online recovery, with failed store id = 0, the store id never be 0?
-    pub fn force_leader_with_failed_store(&self) {
-        let region_leader = self.region_leaders.as_ref().unwrap();
-        if region_leader.is_empty() {
-            return;
-        }
-
-        let leaders = region_leader.clone();
-        let raft_router = self.router.clone();
-        let router  = self.router.clone();
-        // TODO, we need a correct way to handle the log
-        let th = std::thread::spawn(move || {
-            println!("starting tikv success, start to force leader");
-            // Assume the store 0 is failed for reusing online unsafe recovery
-            let mut failed_stores = HashSet::default();
-            failed_stores.insert(0);
-            let syncer = UnsafeRecoveryForceLeaderSyncer::new(
-                0, // no need the report
-                router.clone(),
-            );
-            
-            for leader in &leaders {
-
-                if let Err(e) = raft_router.significant_send(
-                    leader.region_id,
-                    SignificantMsg::EnterForceLeaderState {
-                        syncer: syncer.clone(),
-                        failed_stores: failed_stores.clone(),
-                    },
-                ) {
-                    println!("fail to send force leader message for recovery Error {}", e);
-                }
-            }
-            println!("all region state adjustments are done");
+    fn wait_apply_leaders(&self) {
+        let router = self.router.clone();
+        println!("apply leader log started");
+        let wait_apply = UnsafeRecoveryWaitApplySyncer::new(0, router.clone(), true);
+        router.broadcast_normal(|| {
+        PeerMsg::SignificantMsg(SignificantMsg::UnsafeRecoveryWaitApply(wait_apply.clone()))
         });
-        
-        th.join().unwrap();
     }
 }
 
-impl<ER: RaftEngine> recoverypb::Recovery for RecoveryService<ER> {
-    fn check_raft_status(&mut self, _ctx: RpcContext, _req: GetRaftStatusRequest, sink: UnarySink<GetRaftStatusResponse>) {
-        // TODO: implement a check raft status inteface
-        let router = self.router.clone();
-        let handle_task = async move {
-            println!("check_raft_status started");
+impl<ER: RaftEngine> recoverdatapb::RecoverData for RecoveryService<ER> {
+    fn recover_cmd(&mut self, ctx: RpcContext, mut stream: RequestStream<RecoverCmdRequest>, sink: ClientStreamingSink<RecoverCmdResponse>) {
+        println!("start to recovery the region meta");
 
-            let wait_apply = UnsafeRecoveryWaitApplySyncer::new(0, router.clone(), true);
-            router.broadcast_normal(|| {
-            PeerMsg::SignificantMsg(SignificantMsg::UnsafeRecoveryWaitApply(wait_apply.clone()))
-            });
+        let mut leaders = Vec::new();
+        let _res = block_on(async {
+            while let Some(req) = stream.next().await {
+                let req = req.map_err(|e| eprintln!("rpc recv fail: {}", e)).unwrap();
+                if req.as_leader {
+                    leaders.push(req.region_id);
+                }
+            }
+        });
 
-            let rep = GetRaftStatusResponse::default();
-            let _ = sink.success(rep).await;
-        };
-        self.threads.spawn_ok(handle_task);
+        self.force_leader(leaders.clone());
+        self.wait_apply_leaders();
+        ctx.spawn(async {
+            let _ = sink.success(RecoverCmdResponse::default()).await;
+        });
 
+        return;
     }
+
     // currently we only delete the lock cf and write cf, the data cf will not delete in this version.
     fn resolve_kv_data(&mut self, _ctx: RpcContext, req: ResolveRequest, sink: UnarySink<ResolveResponse>)
     {
@@ -183,16 +154,8 @@ impl<ER: RaftEngine> recoverypb::Recovery for RecoveryService<ER> {
                 keys::DATA_MIN_KEY,
                 keys::DATA_MAX_KEY,
                 false,
-                |key, value| {
+                |key, _value| {
                     println!("lock key : {:?}", key);
-
-                    let lock = box_try!(Lock::parse(value));
-                    if lock.ts.into_inner() <= resolved_ts {
-                        println!("the resolved_ts has issue during the backup");
-                        // TODO: panic may necessary, here.
-                        return Ok(true);
-                    }
-
                     kv_wb.delete(key).unwrap();
                     Ok(true)
                 },

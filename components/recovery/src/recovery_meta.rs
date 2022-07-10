@@ -4,13 +4,12 @@ use std::{error::Error as StdError,
     net::SocketAddr,
     sync::Arc,
     str::FromStr,
-    collections::HashMap,
 };
 
 use futures::executor::block_on;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use futures::sink::SinkExt;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self};
 use tikv::config::TiKvConfig;
 use encryption_export::data_key_manager_from_config;
 use engine_rocks::raw_util::new_engine_opt;
@@ -21,14 +20,19 @@ use engine_traits::{
 };
 
 use pd_client::{PdClient, RpcClient};
-use grpcio::{ChannelBuilder, Environment, ServerBuilder, WriteFlags};
+use grpcio::{ChannelBuilder,
+    Environment,
+    ServerBuilder,
+    WriteFlags,
+    RpcContext,
+    ServerStreamingSink,
+    };
 use kvproto::raft_serverpb::{PeerState, RaftApplyState, RaftLocalState, RegionLocalState, StoreIdent};
 use kvproto::metapb;
 
-use kvproto::recoverymetapb_grpc::{RecoveryMeta, create_recovery_meta};
-use kvproto::recoverymetapb::{*};
+use kvproto::recovermetapb_grpc::{RecoverMeta, create_recover_meta};
+use kvproto::recovermetapb::{*};
 use thiserror::Error;
-use crate::Leader;
 
 // TODO ERROR code may need more specific
 #[derive(Debug, Error)]
@@ -42,9 +46,57 @@ pub enum Error {
     #[error("{0:?}")]
     Other(#[from] Box<dyn StdError + Sync + Send>),
 }
-// BR get the store info from PD when register had done
+
+// Notice: the start_recovery will start a exclusive gRPC serivce, the purpose is to handle the data before tikv node started
+// Why not use TiKV gRPC service? gRPC service start too late, and really hard to reuse the exisited gRPC service.
+pub fn start_recovery(config: TiKvConfig, pd_client: Arc<RpcClient>)
+{
+    // TODO init a separete log file for recording meta and recovery meta log.
+    //let _guard = log_util::init_log(None);
+    let env = Arc::new(Environment::new(1));
+    let (tx, rx) = sync_channel::<bool>(1);
+
+    let recovery = RecoverMetaSerivce::new(config.clone(), tx);
+    let service = create_recover_meta(recovery);
+    
+    // registry the store to PD
+    registry_store_to_pd(config.clone(), pd_client);
+    // TODO, shall we limit the memory usage
+    //let quota = ResourceQuota::new(Some("RecoverMetaServerQuota")).resize_memory(1024 * 1024);
+    let ch_builder = ChannelBuilder::new(env.clone());
+
+    let addr = SocketAddr::from_str(config.server.addr.as_ref()).unwrap();
+    let ip = format!("{}", addr.ip());
+    println!("stage: start recovery service before tikv fully start");
+    let mut server = ServerBuilder::new(env)
+        .register_service(service)
+        .bind(&ip, addr.port())
+        .channel_args(ch_builder.build_args())
+        .build()
+        .unwrap();
+        server.start();
+        for (host, port) in server.bind_addrs() {
+            println!("listening on {}:{}", host, port);
+        }
+
+        // wait the exit service
+        let _exit = match rx.recv() {
+            Ok(x) => x,
+            Err(_e) => {
+                println!("ReadMeta Failed.");
+                return;
+            }
+        };
+
+        // shutdown the service, will this enough to release the socket resource?
+        let _ = block_on(server.shutdown());
+        println!("shutdown server");
+}
+
+// BR get the store info from PD when registery had been done
 // the node start will update the store with more info
 pub fn registry_store_to_pd(config: TiKvConfig, pd_client: Arc<RpcClient>) {
+    println!("stage: register the store into pd service.");
     let server_config = config.clone();
     let local_engine_service = create_local_engine_service(&server_config); 
     let store_id = local_engine_service.unwrap().get_store_id().unwrap();
@@ -75,75 +127,20 @@ pub fn registry_store_to_pd(config: TiKvConfig, pd_client: Arc<RpcClient>) {
                 .to_string(),
         );
 
-    //TODO: is there any thing to do?
+    println!("put_store, store id: {} store version: {}", store.get_id(), store.get_version());
+    // put store is just update the store to pd, so that the br can get the tikv service from pd
     let _status = pd_client.put_store(store.clone());
-    //info!("initializing replication mode"; "status" => ?status, "store_id" => self.store.id);
-}
-// Notice: the start_recovery will start a exclusive gRPC serivce, the purpose is to handle the data before tikv node started
-// Why not use TiKV gRPC service? gRPC service start too late, and really hard to reuse the exisited gRPC service.
-pub fn start_recovery(config: TiKvConfig, pd_client: Arc<RpcClient>) -> Result<Vec<Leader>, Error>
-{
-    // TODO init a separete log file for recording meta and recovery meta log.
-    //let _guard = log_util::init_log(None);
-    let env = Arc::new(Environment::new(1));
-    let (tx, rx) = sync_channel::<HashMap::<u64, RecoveryCmdRequest>>(1);
-
-    let recovery = RecoverMetaSerivce::new(config.clone(), tx);
-    let service = create_recovery_meta(recovery);
-    
-    // registry the store to PD
-    registry_store_to_pd(config.clone(), pd_client);
-    // TODO, shall we limit the memory usage
-    //let quota = ResourceQuota::new(Some("RecoveryMetaServerQuota")).resize_memory(1024 * 1024);
-    let ch_builder = ChannelBuilder::new(env.clone());
-
-    let addr = SocketAddr::from_str(config.server.addr.as_ref()).unwrap();
-    let ip = format!("{}", addr.ip());
-
-    let mut server = ServerBuilder::new(env)
-        .register_service(service)
-        .bind(&ip, addr.port())
-        .channel_args(ch_builder.build_args())
-        .build()
-        .unwrap();
-        server.start();
-        for (host, port) in server.bind_addrs() {
-            println!("listening on {}:{}", host, port);
-        }
-
-        // wait the force leaders list is generated
-        let cmds = match rx.recv() {
-            //TODO, what about the leaders list is None
-            Ok(x) => x,
-            Err(_e) => {
-                println!("get leader list failure.");
-                return Err(Error::NotFound(format!("Received leader error.")));
-            }
-        };
-
-        // TODO: part I, do some handling for local engine
-        // TODO: part II, return the leader list to TiKV and start TiKV to force leader.
-        let mut leaders = Vec::new();
-        for (_idx, cmd) in cmds.iter() {
-            if cmd.as_leader {
-                leaders.push(Leader{region_id:cmd.get_region_id(), commit_index: cmd.get_leader_commit_index(),});
-            }
-        }
-
-        // shutdown the service, will this enough to release the socket resource?
-        let _ = block_on(server.shutdown());
-        Ok(leaders)
 }
 
 #[derive(Clone)]
 pub struct RecoverMetaSerivce {
     config: TiKvConfig,
-    tx: SyncSender<HashMap::<u64, RecoveryCmdRequest>>,
+    tx: SyncSender<bool>,
 }
 
 
 impl RecoverMetaSerivce {
-    pub fn new(config: TiKvConfig, tx: SyncSender<HashMap::<u64, RecoveryCmdRequest>>) -> RecoverMetaSerivce{
+    pub fn new(config: TiKvConfig, tx: SyncSender<bool>) -> RecoverMetaSerivce{
         //1. regrestry the store into PD, so that BR can reach the TiKV via PD GetAllStores
         RecoverMetaSerivce {
             config: config,
@@ -157,8 +154,8 @@ impl RecoverMetaSerivce {
     }
 }
 
-impl RecoveryMeta for RecoverMetaSerivce {
-    fn read_region_meta(&mut self, ctx: ::grpcio::RpcContext, _req: ReadRegionMetaRequest, mut sink: ::grpcio::ServerStreamingSink<RegionMeta>) {
+impl RecoverMeta for RecoverMetaSerivce {
+    fn read_region_meta(&mut self, ctx: RpcContext, _req: ReadRegionMetaRequest, mut sink: ServerStreamingSink<RegionMeta>) {
         // implement a service method for BR to read the region meta
         println!("start to response the region meta");
         let local_engine_service = create_local_engine_service(&self.config);
@@ -173,32 +170,19 @@ impl RecoveryMeta for RecoverMetaSerivce {
 
             // TODO Error handling necessary
             if let Err(e) = sink.send_all(&mut metas).await {
-                println!("send meta: {:?}", e);
+                println!("send meta error: {:?}", e);
                 return;
             }
+
+            println!("meta sent already");
             let _ = sink.close().await;
+
         };
-
         ctx.spawn(task);
-
+        
+        let _ = self.tx.send(true);
     }
-    fn recovery_cmd(&mut self, ctx: ::grpcio::RpcContext, mut stream: ::grpcio::RequestStream<RecoveryCmdRequest>, sink: ::grpcio::ClientStreamingSink<RecoveryCmdResponse>) {
-        println!("start to recovery the region meta");
-        //wait for the recovery command to recover the raft state, late on, we could bring all valid region back online to algin the log.
-        let tx = self.tx.clone();
 
-        let task = async move {
-            let mut leaders = HashMap::<u64, RecoveryCmdRequest>::default();
-            while let Some(req) = stream.next().await {
-                let req = req.map_err(|e| eprintln!("rpc recv fail: {}", e)).unwrap();
-                assert!(leaders.insert(req.region_id, req).is_none());
-            }
-            tx.send(leaders).unwrap();
-            let _ = sink.success(RecoveryCmdResponse::default()).await;
-        };
-
-        ctx.spawn(task);
-    }
 }
 
 // the service to operator the local engines
@@ -208,7 +192,6 @@ pub trait LocalEngineService{
     //fn recovery_raft_state(&self);
     fn get_store_id(&self) -> Result<u64, String>;
 }
-
 
 impl<ER: RaftEngine>  LocalEngineService for LocalEngines<ER> {
     // the function is to read region meta from rocksdb and raft engine
@@ -337,9 +320,8 @@ impl LocalRegion {
         region_meta.start_key = self.region_local_state.get_region().get_start_key().to_owned();
         region_meta.end_key = self.region_local_state.get_region().get_end_key().to_owned();
 
-        region_meta.applied_index = self.raft_apply_state.applied_index;
+        region_meta.last_log_term = self.raft_local_state.get_hard_state().term;
         region_meta.last_index = self.raft_local_state.last_index;
-        region_meta.term = self.raft_local_state.get_hard_state().term;
 
         return region_meta;
     } 
