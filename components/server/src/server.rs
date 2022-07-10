@@ -237,6 +237,7 @@ struct TiKvServer<ER: RaftEngine> {
     background_worker: Worker,
     sst_worker: Option<Box<LazyWorker<String>>>,
     quota_limiter: Arc<QuotaLimiter>,
+    recovery_mode: bool,
 }
 
 struct TiKvEngines<EK: KvEngine, ER: RaftEngine> {
@@ -282,11 +283,12 @@ impl<ER: RaftEngine> TiKvServer<ER> {
         // TODO: let recovery_mode = block_on(pd_client.get_recovery_mode()).expect("failed to get recovery mode from PD");
         // Run a TiKV server in recovery mode
         // recovery tikv from mountpoint of block level storage
-        if config.recovery_mode {
+        //if config.recovery_mode {
             Self::enter_recovery_mode(&mut config);
             Self::recover_meta(config.clone(), pd_client.clone());
             println!("phase 1: recovery region meta done");
-        }
+            let recovery_mode = true;
+        //}
 
         // Initialize and check config
         let cfg_controller = Self::init_config(config);
@@ -351,7 +353,7 @@ impl<ER: RaftEngine> TiKvServer<ER> {
             flow_info_receiver: None,
             sst_worker: None,
             quota_limiter,
-
+            recovery_mode,
         }
     }
 
@@ -1255,7 +1257,7 @@ impl<ER: RaftEngine> TiKvServer<ER> {
         }
 
         // the present tikv in recovery mode, start recovery service
-        if self.config.recovery_mode {
+        if self.recovery_mode {
             let recovery_service = RecoveryService::new(
                 // TODO: resued debug thread pool, we shall create a thread pool or reused someone?
                 //servers.server.get_debug_thread_pool().clone(),
@@ -1270,6 +1272,7 @@ impl<ER: RaftEngine> TiKvServer<ER> {
             {
                 fatal!("failed to register recovery service");
             }
+            info!("recovery service registeried.");
         }
     }
 

@@ -2793,9 +2793,6 @@ pub struct TiKvConfig {
     #[online_config(submodule)]
     pub rocksdb: DbConfig,
 
-    #[online_config(skip)]
-    pub recovery_mode: bool,
-
     #[online_config(submodule)]
     pub raftdb: RaftDbConfig,
 
@@ -2853,7 +2850,6 @@ impl Default for TiKvConfig {
             panic_when_unexpected_key_or_data: false,
             enable_io_snoop: true,
             abort_on_panic: false,
-            recovery_mode: true,
             memory_usage_limit: None,
             memory_usage_high_water: 0.9,
             log: LogConfig::default(),

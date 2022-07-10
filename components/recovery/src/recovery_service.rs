@@ -57,7 +57,7 @@ impl<ER: RaftEngine> RecoveryService<ER> {
             .before_stop(move |_| tikv_alloc::remove_thread_memory_accessor())
             .create()
             .unwrap();
-
+            println!("new recovery service");
         RecoveryService {
             threads,
             engines,

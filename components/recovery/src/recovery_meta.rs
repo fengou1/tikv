@@ -55,7 +55,6 @@ pub fn start_recovery(config: TiKvConfig, pd_client: Arc<RpcClient>)
     //let _guard = log_util::init_log(None);
     let env = Arc::new(Environment::new(1));
     let (tx, rx) = sync_channel::<bool>(1);
-
     let recovery = RecoverMetaSerivce::new(config.clone(), tx);
     let service = create_recover_meta(recovery);
     
