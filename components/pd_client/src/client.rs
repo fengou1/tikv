@@ -583,6 +583,7 @@ impl PdClient for RpcClient {
         leader: metapb::Peer,
         region_stat: RegionStat,
         replication_status: Option<RegionReplicationStatus>,
+        has_pending_conf: bool,
     ) -> PdFuture<()> {
         PD_HEARTBEAT_COUNTER_VEC.with_label_values(&["send"]).inc();
 
@@ -604,6 +605,7 @@ impl PdClient for RpcClient {
         if let Some(s) = replication_status {
             req.set_replication_status(s);
         }
+        req.set_has_pending_conf(has_pending_conf);
         let mut interval = pdpb::TimeInterval::default();
         interval.set_start_timestamp(region_stat.last_report_ts.into_inner());
         interval.set_end_timestamp(UnixSecs::now().into_inner());

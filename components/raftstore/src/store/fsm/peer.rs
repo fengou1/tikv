@@ -915,8 +915,9 @@ where
             "target_index" => target_index,
             "applied_index" => self.fsm.peer.raft_group.raft.raft_log.applied,
         );
-    
-        // during the snapshot recovery, follower unconditionaly forward the commit_index.
+
+        // during the snapshot recovery, follower unconditionaly forward the
+        // commit_index.
         if !self.fsm.peer.is_leader() {
             // self.fsm
             // .peer
@@ -928,7 +929,7 @@ where
                 "target_index" => target_index,
                 "applied_index" => self.fsm.peer.raft_group.raft.raft_log.applied,
             );
-           // self.fsm.has_ready = true;
+            // self.fsm.has_ready = true;
         }
 
         self.fsm.peer.snapshot_recovery_state = Some(SnapshotRecoveryState::WaitLogApplyToLast {
