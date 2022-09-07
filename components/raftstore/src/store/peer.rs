@@ -611,7 +611,7 @@ pub struct SnapshotRecoveryWaitApplySyncer {
 }
 
 impl SnapshotRecoveryWaitApplySyncer {
-    pub fn new(region_id: u64, sender: SyncSender<u64>,) -> Self {
+    pub fn new(region_id: u64, sender: SyncSender<u64>) -> Self {
         let thread_safe_router = Mutex::new(sender);
         let abort = Arc::new(Mutex::new(false));
         let abort_clone = abort.clone();
@@ -1937,6 +1937,11 @@ where
         }
     }
 
+    /// get pending conf.
+    pub fn get_pending_conf(&self) -> bool {
+        self.raft_group.raft.has_pending_conf()
+    }
+
     /// Collects all down peers.
     pub fn collect_down_peers<T>(&mut self, ctx: &PollContext<EK, ER, T>) -> Vec<PeerStats> {
         let max_duration = ctx.cfg.max_peer_down_duration.0;
@@ -2102,8 +2107,8 @@ where
         true
     }
 
-    // during the snapshot recovery, follower unconditionaly forward the commit_index.
-    // pub fn force_forward_commit_index(&mut self) -> bool {
+    // during the snapshot recovery, follower unconditionaly forward the
+    // commit_index. pub fn force_forward_commit_index(&mut self) -> bool {
 
     //     let persisted = self.raft_group.raft.raft_log.persisted;
 
@@ -5194,6 +5199,7 @@ where
             approximate_size: self.approximate_size,
             approximate_keys: self.approximate_keys,
             replication_status: self.region_replication_status(),
+            has_pending_conf: self.get_pending_conf(),
         });
         if let Err(e) = ctx.pd_scheduler.schedule(task) {
             error!(
