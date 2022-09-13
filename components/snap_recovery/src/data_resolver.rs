@@ -76,7 +76,7 @@ impl DataResolverManager {
     pub fn start(&self) {
         self.resolve_lock();
         self.resolve_write();
-        self.wait();
+        //self.wait();
     }
 
     fn resolve_lock(&self) {
