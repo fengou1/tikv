@@ -6,8 +6,14 @@ use std::{
     time::Instant,
 };
 
-use engine_rocks::RocksEngine;
-use engine_traits::{CfNamesExt, CfOptionsExt, Engines, Iterable, Peekable, RaftEngine, CF_RAFT};
+use engine_rocks::{
+    raw::{CompactOptions, DBBottommostLevelCompaction},
+    RocksEngine,
+    util::get_cf_handle,
+};
+use engine_traits::{
+    CfNamesExt, CfOptionsExt, Engines, Iterable, Peekable, RaftEngine, CF_RAFT,
+};
 use futures::{
     channel::mpsc,
     executor::{ThreadPool, ThreadPoolBuilder},
@@ -257,6 +263,20 @@ impl<ER: RaftEngine> RecoveryService<ER> {
         Ok(store_id)
     }
 }
+    /// Compact the cf[start..end) in the db.
+    fn compact(engine: &RocksEngine, cf_name: &str, threads: u32) -> Result<()> {
+        info!("recovery starts manual compact");
+        let db = engine.as_inner();
+        let handle = get_cf_handle(db, cf_name).unwrap();
+        let mut compact_opts = CompactOptions::new();
+        compact_opts.set_max_subcompactions(threads as i32);
+        compact_opts.set_exclusive_manual_compaction(false);
+        compact_opts.set_bottommost_level_compaction(DBBottommostLevelCompaction::Force);
+        db.compact_range_cf_opt(handle, &compact_opts, None, None);
+        info!("recovery finishes manual compact");
+        Ok(())
+    }
+
 impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
     fn read_region_meta(
         &mut self,
@@ -378,6 +398,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
         sink: UnarySink<WaitApplyResponse>,
     ) {
         let router = self.router.clone();
+        let db = self.engines.kv.clone();
         info!("wait_apply start");
         let task = async move {
             let now = Instant::now();
@@ -388,6 +409,12 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
                 "all region apply to last log takes {}",
                 now.elapsed().as_secs()
             );
+
+            for cf_name in db.cf_names() {
+                compact(&db, cf_name, 32).expect("compact kvdb failure");
+            }
+            info!("compact rocksdb takes {}", now.elapsed().as_secs());
+            // TODO: compaction may cause a lot of data.
             let resp = WaitApplyResponse::default();
             let _ = sink.success(resp).await;
         };
