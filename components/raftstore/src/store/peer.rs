@@ -8,7 +8,7 @@ use std::{
     fmt, mem,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc::SyncSender,
+        mpsc::Sender as StdSender,
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -611,7 +611,7 @@ pub struct SnapshotRecoveryWaitApplySyncer {
 }
 
 impl SnapshotRecoveryWaitApplySyncer {
-    pub fn new(region_id: u64, sender: SyncSender<u64>) -> Self {
+    pub fn new(region_id: u64, sender: StdSender<u64>) -> Self {
         let thread_safe_router = Mutex::new(sender);
         let abort = Arc::new(Mutex::new(false));
         let abort_clone = abort.clone();

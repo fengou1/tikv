@@ -2,18 +2,17 @@
 
 use std::{
     error::Error as StdError,
-    sync::mpsc::{sync_channel, SyncSender},
+    sync::mpsc::{channel, Sender},
+    thread::Builder,
     time::Instant,
 };
 
 use engine_rocks::{
     raw::{CompactOptions, DBBottommostLevelCompaction},
-    RocksEngine,
     util::get_cf_handle,
+    RocksEngine,
 };
-use engine_traits::{
-    CfNamesExt, CfOptionsExt, Engines, Iterable, Peekable, RaftEngine, CF_RAFT,
-};
+use engine_traits::{CfNamesExt, CfOptionsExt, Engines, Iterable, Peekable, RaftEngine, CF_RAFT};
 use futures::{
     channel::mpsc,
     executor::{ThreadPool, ThreadPoolBuilder},
@@ -38,7 +37,7 @@ use raftstore::{
     },
 };
 use thiserror::Error;
-use tikv_util::sys::thread::ThreadBuildWrapper;
+use tikv_util::sys::thread::{StdThreadBuildWrapper, ThreadBuildWrapper};
 
 use crate::data_resolver::DataResolverManager;
 // TODO: ERROR need more specific
@@ -151,7 +150,7 @@ impl<ER: RaftEngine> RecoveryService<ER> {
     // a new wait apply syncer share with all regions,
     // when all region reached the target index, share reference decreased to 0,
     // trigger closure to send finish info back.
-    pub fn wait_apply_last(router: RaftRouter<RocksEngine, ER>, sender: SyncSender<u64>) {
+    pub fn wait_apply_last(router: RaftRouter<RocksEngine, ER>, sender: Sender<u64>) {
         // PR https://github.com/tikv/tikv/pull/13374
         let wait_apply = SnapshotRecoveryWaitApplySyncer::new(0, sender);
         // ensure recovery cmd be executed so the leader apply to last index
@@ -263,19 +262,37 @@ impl<ER: RaftEngine> RecoveryService<ER> {
         Ok(store_id)
     }
 }
-    /// Compact the cf[start..end) in the db.
-    fn compact(engine: &RocksEngine, cf_name: &str, threads: u32) -> Result<()> {
-        info!("recovery starts manual compact");
-        let db = engine.as_inner();
-        let handle = get_cf_handle(db, cf_name).unwrap();
-        let mut compact_opts = CompactOptions::new();
-        compact_opts.set_max_subcompactions(threads as i32);
-        compact_opts.set_exclusive_manual_compaction(false);
-        compact_opts.set_bottommost_level_compaction(DBBottommostLevelCompaction::Force);
-        db.compact_range_cf_opt(handle, &compact_opts, None, None);
-        info!("recovery finishes manual compact");
-        Ok(())
+/// This may a temp solution, in future, we may move forward to FlashBack
+/// delete data Compact the cf[start..end) in the db.
+/// purpose of it to resolve compaction filter gc after restore cluster
+fn compact(engine: RocksEngine) -> Result<()> {
+    let mut handles = Vec::new();
+    for cf_name in engine.cf_names() {
+        let cf = cf_name.clone().to_owned();
+        let kv_db = engine.clone();
+        let h = Builder::new()
+            .name(format!("compact-{}", cf))
+            .spawn_wrapper(move || {
+                info!("recovery starts manual compact"; "cf" => cf.clone());
+                tikv_alloc::add_thread_memory_accessor();
+                let db = kv_db.as_inner();
+                let handle = get_cf_handle(&db, cf.as_str()).unwrap();
+                let mut compact_opts = CompactOptions::new();
+                compact_opts.set_max_subcompactions(64);
+                compact_opts.set_exclusive_manual_compaction(false);
+                compact_opts.set_bottommost_level_compaction(DBBottommostLevelCompaction::Skip);
+                db.compact_range_cf_opt(handle, &compact_opts, None, None);
+                tikv_alloc::remove_thread_memory_accessor();
+                info!("recovery finishes manual compact"; "cf" => cf);
+            })
+            .expect("failed to spawn compaction thread");
+        handles.push(h);
     }
+    for h in handles {
+        h.join().unwrap();
+    }    
+    Ok(())
+}
 
 impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
     fn read_region_meta(
@@ -297,7 +314,6 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
                     .map(|x| Ok((x, WriteFlags::default()))),
             );
 
-            // TODO Error handling necessary
             if let Err(e) = sink.send_all(&mut metas).await {
                 error!("send meta error: {:?}", e);
                 return;
@@ -308,6 +324,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
         ctx.spawn(task);
     }
 
+    // assign region leader and wait leader apply to last log
     fn recover_region(
         &mut self,
         _ctx: RpcContext<'_>,
@@ -336,7 +353,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
                     info!("region {} starts to campaign", region_id);
                 }
 
-                let (tx, rx) = sync_channel::<u64>(1);
+                let (tx, rx) = channel();
                 let callback = Callback::read(Box::new(move |_| {
                     if tx.send(1).is_err() {
                         error!("response failed"; "region_id" => region_id);
@@ -362,14 +379,18 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
             // wait apply to the last log
             let mut rx_apply = Vec::with_capacity(leaders.len());
             for &region_id in &leaders {
-                let (tx, rx) = sync_channel::<u64>(1);
+                let (tx, rx) = channel();
                 let wait_apply = SnapshotRecoveryWaitApplySyncer::new(region_id, tx.clone());
-                raft_router
-                    .significant_send(
-                        region_id,
-                        SignificantMsg::SnapshotRecoveryWaitApply(wait_apply.clone()),
-                    )
-                    .unwrap();
+                if let Err(e) = raft_router.significant_send(
+                    region_id,
+                    SignificantMsg::SnapshotRecoveryWaitApply(wait_apply.clone()),
+                ) {
+                    error!(
+                        "failed to send wait apply";
+                        "region_id" => region_id,
+                        "err" => ?e,
+                    );
+                }
                 rx_apply.push(Some(rx));
             }
 
@@ -391,6 +412,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
         self.threads.spawn_ok(task);
     }
 
+    // Leader already assigned and apply to last log
     fn wait_apply(
         &mut self,
         _ctx: RpcContext<'_>,
@@ -402,19 +424,15 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
         info!("wait_apply start");
         let task = async move {
             let now = Instant::now();
-            let (tx, rx) = sync_channel::<u64>(1);
+            let (tx, rx) = channel();
             RecoveryService::wait_apply_last(router, tx.clone());
             let _ = rx.recv().unwrap();
             info!(
                 "all region apply to last log takes {}",
                 now.elapsed().as_secs()
             );
-
-            for cf_name in db.cf_names() {
-                compact(&db, cf_name, 32).expect("compact kvdb failure");
-            }
+            compact(db.clone()).expect("compact kvdb failure");
             info!("compact rocksdb takes {}", now.elapsed().as_secs());
-            // TODO: compaction may cause a lot of data.
             let resp = WaitApplyResponse::default();
             let _ = sink.success(resp).await;
         };
