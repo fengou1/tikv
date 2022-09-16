@@ -920,9 +920,6 @@ where
 
         // during the snapshot recovery, broadcast waitapply, some peer may stale
         if !self.fsm.peer.is_leader() {
-            // self.fsm
-            // .peer
-            // .force_forward_commit_index();
             info!(
                 "snapshot follower recovery started";
                 "region_id" => self.region_id(),

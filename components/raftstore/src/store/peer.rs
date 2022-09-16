@@ -5041,8 +5041,8 @@ where
             if self.raft_group.raft.raft_log.applied >= *target_index || force {
                 if self.is_force_leader() {
                     info!(
-                       "Unsafe recovery, finish wait apply";
-                       "region_id" => self.region().get_id(),
+                        "Unsafe recovery, finish wait apply";
+                        "region_id" => self.region().get_id(),
                         "peer_id" => self.peer_id(),
                         "target_index" => target_index,
                         "applied" =>  self.raft_group.raft.raft_log.applied,
@@ -5058,17 +5058,6 @@ where
         if let Some(SnapshotRecoveryState::WaitLogApplyToLast { target_index, .. }) =
             &self.snapshot_recovery_state
         {
-            // if (! self.is_leader()) && self.is_handling_snapshot() {
-            //     info!("snapshot recovery follower waiting apply snapshot";
-            //     "region_id" => self.region().get_id(),
-            //     "peer_id" => self.peer_id(),
-            //     "target_index" => target_index,
-            //     "applied" =>  self.raft_group.raft.raft_log.applied,
-            //     "force" => force,
-            //     );
-            //     return;
-            // }
-
             if self.raft_group.raft.raft_log.applied >= *target_index
                 || force
                 || self.pending_remove

@@ -268,7 +268,7 @@ impl<ER: RaftEngine> RecoveryService<ER> {
 fn compact(engine: RocksEngine) -> Result<()> {
     let mut handles = Vec::new();
     for cf_name in engine.cf_names() {
-        let cf = cf_name.clone().to_owned();
+        let cf = cf_name.to_owned().clone();
         let kv_db = engine.clone();
         let h = Builder::new()
             .name(format!("compact-{}", cf))
@@ -276,7 +276,7 @@ fn compact(engine: RocksEngine) -> Result<()> {
                 info!("recovery starts manual compact"; "cf" => cf.clone());
                 tikv_alloc::add_thread_memory_accessor();
                 let db = kv_db.as_inner();
-                let handle = get_cf_handle(&db, cf.as_str()).unwrap();
+                let handle = get_cf_handle(db, cf.as_str()).unwrap();
                 let mut compact_opts = CompactOptions::new();
                 compact_opts.set_max_subcompactions(64);
                 compact_opts.set_exclusive_manual_compaction(false);
@@ -290,7 +290,7 @@ fn compact(engine: RocksEngine) -> Result<()> {
     }
     for h in handles {
         h.join().unwrap();
-    }    
+    }
     Ok(())
 }
 
@@ -420,7 +420,6 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
         sink: UnarySink<WaitApplyResponse>,
     ) {
         let router = self.router.clone();
-        let db = self.engines.kv.clone();
         info!("wait_apply start");
         let task = async move {
             let now = Instant::now();
@@ -431,8 +430,6 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
                 "all region apply to last log takes {}",
                 now.elapsed().as_secs()
             );
-            compact(db.clone()).expect("compact kvdb failure");
-            info!("compact rocksdb takes {}", now.elapsed().as_secs());
             let resp = WaitApplyResponse::default();
             let _ = sink.success(resp).await;
         };
@@ -452,7 +449,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
         let resolver = DataResolverManager::new(self.engines.kv.clone(), tx, resolved_ts.into());
         info!("start to resolve kv data");
         resolver.start();
-
+        let db = self.engines.kv.clone();
         let store_id = self.get_store_id();
         let send_task = async move {
             let id = store_id.expect("failed to get store id");
@@ -462,6 +459,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
                 Ok((resp, WriteFlags::default()))
             });
             sink.send_all(&mut s).await?;
+            compact(db.clone()).expect("compact kvdb failure");
             sink.close().await?;
             Ok(())
         }

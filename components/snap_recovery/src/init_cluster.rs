@@ -71,6 +71,9 @@ pub fn enter_snap_recovery_mode(config: &mut TikvConfig) {
     config.raft_store.max_leader_missing_duration =
         ReadableDuration(bt * 4 * SNAP_MAX_TIMEOUT as _);
 
+    // disabled gc compaction filter
+    config.gc.enable_compaction_filter = false;
+
     // for optimize the write
     config.raft_store.snap_generator_pool_size = 20;
     // applied snapshot mem size
@@ -88,9 +91,6 @@ pub fn enter_snap_recovery_mode(config: &mut TikvConfig) {
     config.rocksdb.max_background_jobs = 32;
     // disable resolve ts during the recovery
     config.resolved_ts.enable = false;
-
-    config.server.grpc_keepalive_timeout = ReadableDuration::secs(300);
-    config.server.grpc_keepalive_time = ReadableDuration::secs(90);
 
     // Disable region split during recovering.
     config.coprocessor.region_max_size = Some(ReadableSize::gb(MAX_REGION_SIZE));
