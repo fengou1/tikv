@@ -37,6 +37,9 @@ pub enum Error {
 
 /// `DataResolverManager` is the manager that manages the resolve kv data
 /// process.
+/// currently, we do not support retry the data resolver, tidb-operator does not
+/// support apply a restore twice TODO: in future, BR may able to retry if some
+/// accident
 pub struct DataResolverManager {
     /// The engine we are working on
     engine: RocksEngine,
@@ -313,7 +316,7 @@ impl WriteResolverWorker {
 #[cfg(test)]
 mod tests {
     use engine_traits::{WriteBatch, WriteBatchExt, ALL_CFS, CF_LOCK};
-    use futures::{channel::mpsc, StreamExt};
+    use futures::channel::mpsc;
     use tempfile::Builder;
     use txn_types::{Lock, LockType, WriteType};
 
@@ -332,24 +335,24 @@ mod tests {
         // write cf will remain one key
         let write = vec![
             // key, start_ts, commit_ts
-            (b"k", 104, 105),
-            (b"k", 102, 103),
-            (b"k", 100, 101),
+            (b"k", 189, 190),
+            (b"k", 122, 123),
+            (b"k", 110, 111),
             (b"k", 98, 99),
         ];
         let default = vec![
             // key, start_ts
-            (b"k", 104),
-            (b"k", 102),
-            (b"k", 100),
+            (b"k", 189),
+            (b"k", 122),
+            (b"k", 110),
             (b"k", 98),
         ];
         let lock = vec![
             // key, start_ts, for_update_ts, lock_type, short_value, check
             (b"k", 100, 0, LockType::Put, false),
             (b"k", 100, 0, LockType::Delete, false),
-            (b"k", 100, 0, LockType::Put, true),
-            (b"k", 100, 0, LockType::Delete, true),
+            (b"k", 99, 0, LockType::Put, true),
+            (b"k", 98, 0, LockType::Delete, true),
         ];
         let mut kv = vec![];
         for (key, start_ts, commit_ts) in write {
@@ -391,17 +394,13 @@ mod tests {
         }
         wb.write().unwrap();
 
-        let (tx, rx) = mpsc::unbounded();
+        let (tx, _) = mpsc::unbounded();
         let resolver = DataResolverManager::new(fake_engine.clone(), tx, 100.into());
         resolver.start();
-
-        let mut count: u64 = 0;
-        let mut _s = rx.map(|resp| {
-            count += resp.get_resolved_key_count();
-        });
-
+        // wait to delete finished
         resolver.wait();
 
+        // write cf will remain only one key
         let readopts = IterOptions::new(None, None, false);
         let mut write_iter = fake_engine
             .iterator_opt(CF_WRITE, readopts.clone())
@@ -414,6 +413,8 @@ mod tests {
             write_iter.next().unwrap();
             remaining_writes.push((key, write));
         }
+
+        // default cf will remain only one key
         let mut default_iter = fake_engine
             .iterator_opt(CF_DEFAULT, readopts.clone())
             .unwrap();
@@ -426,6 +427,7 @@ mod tests {
             remaining_defaults.push((key, value));
         }
 
+        // lock cf will be clean
         let mut lock_iter = fake_engine.iterator_opt(CF_LOCK, readopts).unwrap();
         lock_iter.seek_to_first().unwrap();
         let mut remaining_locks = vec![];
