@@ -331,7 +331,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
                 Ok((resp, WriteFlags::default()))
             });
             sink.send_all(&mut s).await?;
-            compact(db.clone()).expect("compact kvdb failure");
+            compact(db.clone())?
             sink.close().await?;
             Ok(())
         }
