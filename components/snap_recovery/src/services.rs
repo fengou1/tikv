@@ -144,7 +144,7 @@ fn compact(engine: RocksEngine) -> Result<()> {
                 info!("recovery starts manual compact"; "cf" => cf.clone());
                 tikv_alloc::add_thread_memory_accessor();
                 let db = kv_db.as_inner();
-                let handle = get_cf_handle(db, cf.as_str()).unwrap();
+                let handle = get_cf_handle(db, cf.as_str())?;
                 let mut compact_opts = CompactOptions::new();
                 compact_opts.set_max_subcompactions(64);
                 compact_opts.set_exclusive_manual_compaction(false);
@@ -152,8 +152,7 @@ fn compact(engine: RocksEngine) -> Result<()> {
                 db.compact_range_cf_opt(handle, &compact_opts, None, None);
                 tikv_alloc::remove_thread_memory_accessor();
                 info!("recovery finishes manual compact"; "cf" => cf);
-            })
-            ?
+            })?;
         handles.push(h);
     }
     for h in handles {
@@ -331,7 +330,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
                 Ok((resp, WriteFlags::default()))
             });
             sink.send_all(&mut s).await?;
-            compact(db.clone())?
+            compact(db.clone())?;
             sink.close().await?;
             Ok(())
         }

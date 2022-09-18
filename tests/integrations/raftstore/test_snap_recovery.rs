@@ -33,7 +33,6 @@ fn test_check_pending_admin() {
     // make a admin request to let leader has pending conf change.
     let leader = new_peer(1, 4);
     cluster.async_add_peer(1, leader).unwrap();
-
     std::thread::sleep(Duration::from_millis(800));
 
     let router = cluster.sim.wl().get_router(1).unwrap();
