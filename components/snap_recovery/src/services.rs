@@ -1,7 +1,7 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    sync::mpsc::{channel, Sender},
+    sync::mpsc::{sync_channel, Sender},
     thread::Builder,
     time::Instant,
 };
@@ -121,9 +121,7 @@ impl<ER: RaftEngine> RecoveryService<ER> {
     // when all region reached the target index, share reference decreased to 0,
     // trigger closure to send finish info back.
     pub fn wait_apply_last(router: RaftRouter<RocksEngine, ER>, sender: Sender<u64>) {
-        // PR https://github.com/tikv/tikv/pull/13374
         let wait_apply = SnapshotRecoveryWaitApplySyncer::new(0, sender);
-        // ensure recovery cmd be executed so the leader apply to last index
         router.broadcast_normal(|| {
             PeerMsg::SignificantMsg(SignificantMsg::SnapshotRecoveryWaitApply(
                 wait_apply.clone(),
@@ -131,6 +129,7 @@ impl<ER: RaftEngine> RecoveryService<ER> {
         });
     }
 }
+
 /// This may a temp solution, in future, we may move forward to FlashBack
 /// delete data Compact the cf[start..end) in the db.
 /// purpose of it to resolve compaction filter gc after restore cluster
@@ -225,7 +224,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
                     info!("region {} starts to campaign", region_id);
                 }
 
-                let (tx, rx) = channel();
+                let (tx, rx) = sync_channel(1);
                 let callback = Callback::read(Box::new(move |_| {
                     if tx.send(1).is_err() {
                         error!("response failed"; "region_id" => region_id);
@@ -251,7 +250,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
             // wait apply to the last log
             let mut rx_apply = Vec::with_capacity(leaders.len());
             for &region_id in &leaders {
-                let (tx, rx) = channel();
+                let (tx, rx) = sync_channel(1);
                 let wait_apply = SnapshotRecoveryWaitApplySyncer::new(region_id, tx.clone());
                 if let Err(e) = raft_router.significant_send(
                     region_id,
@@ -295,7 +294,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
         info!("wait_apply start");
         let task = async move {
             let now = Instant::now();
-            let (tx, rx) = channel();
+            let (tx, rx) = sync_channel(1);
             RecoveryService::wait_apply_last(router, tx.clone());
             let _ = rx.recv().unwrap();
             info!(
