@@ -51,7 +51,6 @@ fn test_check_pending_admin() {
 
     // clear filter so we can make pending admin requests finished.
     cluster.clear_send_filters();
-
     std::thread::sleep(Duration::from_millis(800));
 
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
