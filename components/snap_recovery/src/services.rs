@@ -1,7 +1,7 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    sync::mpsc::{sync_channel, Sender},
+    sync::mpsc::{sync_channel, SyncSender},
     thread::Builder,
     time::Instant,
 };
@@ -31,7 +31,6 @@ use raftstore::{
         SnapshotRecoveryWaitApplySyncer,
     },
 };
-
 use tikv_util::sys::thread::{StdThreadBuildWrapper, ThreadBuildWrapper};
 
 use crate::{data_resolver::DataResolverManager, region_meta_collector::RegionMetaCollector};
@@ -120,7 +119,7 @@ impl<ER: RaftEngine> RecoveryService<ER> {
     // a new wait apply syncer share with all regions,
     // when all region reached the target index, share reference decreased to 0,
     // trigger closure to send finish info back.
-    pub fn wait_apply_last(router: RaftRouter<RocksEngine, ER>, sender: Sender<u64>) {
+    pub fn wait_apply_last(router: RaftRouter<RocksEngine, ER>, sender: SyncSender<u64>) {
         let wait_apply = SnapshotRecoveryWaitApplySyncer::new(0, sender);
         router.broadcast_normal(|| {
             PeerMsg::SignificantMsg(SignificantMsg::SnapshotRecoveryWaitApply(
@@ -144,19 +143,22 @@ fn compact(engine: RocksEngine) -> Result<()> {
                 info!("recovery starts manual compact"; "cf" => cf.clone());
                 tikv_alloc::add_thread_memory_accessor();
                 let db = kv_db.as_inner();
-                let handle = get_cf_handle(db, cf.as_str())?;
+                let handle = get_cf_handle(db, cf.as_str()).unwrap();
                 let mut compact_opts = CompactOptions::new();
                 compact_opts.set_max_subcompactions(64);
                 compact_opts.set_exclusive_manual_compaction(false);
                 compact_opts.set_bottommost_level_compaction(DBBottommostLevelCompaction::Skip);
                 db.compact_range_cf_opt(handle, &compact_opts, None, None);
                 tikv_alloc::remove_thread_memory_accessor();
+
                 info!("recovery finishes manual compact"; "cf" => cf);
-            })?;
+            })
+            .expect("failed to spawn compaction thread");
         handles.push(h);
     }
     for h in handles {
-        h.join().unwrap();
+        h.join()
+            .unwrap_or_else(|e| error!("thread handle join error"; "error" => ?e));
     }
     Ok(())
 }
@@ -330,7 +332,7 @@ impl<ER: RaftEngine> RecoverData for RecoveryService<ER> {
                 Ok((resp, WriteFlags::default()))
             });
             sink.send_all(&mut s).await?;
-            compact(db.clone())?;
+            compact(db.clone()).unwrap_or_else(|e| error!("compact error"; "error" => ?e));
             sink.close().await?;
             Ok(())
         }
