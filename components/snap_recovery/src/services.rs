@@ -153,7 +153,7 @@ fn compact(engine: RocksEngine) -> Result<()> {
                 tikv_alloc::remove_thread_memory_accessor();
                 info!("recovery finishes manual compact"; "cf" => cf);
             })
-            .expect("failed to spawn compaction thread");
+            ?
         handles.push(h);
     }
     for h in handles {
